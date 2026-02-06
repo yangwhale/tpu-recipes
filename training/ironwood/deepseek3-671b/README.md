@@ -20,8 +20,49 @@
 |------|------|-----------|---------------|-----------------|---------------|---------------|-------------|------|
 | 2026-02-06 | 4k-bf16-4x4x8 (128 chips) | bf16 | 27.42 | 299.3 | 598.5 | 2,389.7 | 7.759 | 30 steps，profiler step 9 |
 | 2026-02-06 | 4k-bf16-4x8x8 (256 chips) | bf16 | 27.12 | 302.6 | 605.2 | 2,416.6 | 9.014 | 30 steps，与官方 recipe 参数一致 |
+| 2026-02-06 | 4k-fp8-4x4x8 (128 chips) | fp8_full | 22.39 | 366.5 | 733.1 | 2,926.5 | 8.541 | 30 steps，fp8 量化，比 bf16 快 22% |
 
-### 详细训练日志 - 4x4x8 (128 chips, 2026-02-06)
+### 详细训练日志 - 4x4x8 fp8 (128 chips, 2026-02-06)
+
+| Step | 耗时 (s) | TFLOP/s/device | TFLOP/s/chip | Tokens/s/chip | Loss |
+|------|---------|----------------|--------------|---------------|------|
+| 0 | 156.71 | 52.4 | 104.7 | 418.2 | 12.270 |
+| 1 | 68.30 | 120.2 | 240.3 | 959.5 | 12.270 |
+| 2 | 22.38 | 366.7 | 733.4 | 2,928.2 | 12.127 |
+| 3 | 22.39 | 366.5 | 733.0 | 2,926.8 | 11.914 |
+| 4 | 22.38 | 366.7 | 733.3 | 2,928.1 | 11.677 |
+| 5 | 22.38 | 366.6 | 733.3 | 2,927.7 | 11.457 |
+| 6 | 22.51 | 364.6 | 729.2 | 2,911.6 | 11.242 |
+| 7 | 22.38 | 366.6 | 733.3 | 2,927.9 | 11.030 |
+| 8 | 22.39 | 366.5 | 732.9 | 2,926.4 | 10.821 |
+| 9 | 70.48* | 116.4 | 232.9 | 929.8 | 10.617 |
+| 10 | 22.38 | 366.7 | 733.4 | 2,928.5 | 10.421 |
+| 11 | 22.39 | 366.6 | 733.2 | 2,927.7 | 10.233 |
+| 12 | 22.42 | 366.1 | 732.2 | 2,923.7 | 10.054 |
+| ... | ... | ... | ... | ... | ... |
+| 29 | 22.39 | 366.5 | 733.1 | 2,927.0 | 8.541 |
+
+- **Step 0** 耗时 157s 是 JIT 编译（fp8 quantization 内核编译比 bf16 更耗时）
+- **Step 9** 耗时 70s 是 profiler 采集 xplane 数据
+- **稳态性能 (Step 2+)**: ~22.39 s/step, ~733 TFLOP/s/chip, ~2,927 Tokens/s/chip
+- **Loss 下降**: 12.270 → 8.541 (30.4%)
+
+### bf16 vs fp8 对比 (4x4x8, 128 chips)
+
+| 指标 | bf16 | fp8_full | 变化 |
+|------|------|----------|------|
+| Step Time | 27.42s | 22.39s | -18.3% (快了 22.4%) |
+| TFLOP/s/chip | 598.5 | 733.1 | +22.5% |
+| Tokens/s/chip | 2,389.7 | 2,926.5 | +22.5% |
+| Total Tokens/s | 305,882 | 374,752 | +22.5% |
+| JIT 编译时间 | 125s | 157s | +25.6% (fp8 编译更复杂) |
+| Final Loss (30 steps) | 7.759 | 8.541 | fp8 loss 略高 |
+
+> **说明**: fp8 量化使用 `quantization=fp8_full` + `use_qwix_quantization=True`，通过 fp8 矩阵乘法在 TPU v7 上获得 22.5% 的吞吐提升。
+> fp8 训练的 Loss 略高于 bf16（8.541 vs 7.759），这在预期范围内，因为 fp8 精度低于 bf16，但在大规模训练中 Loss 差异会逐渐缩小。
+> fp8 recipe 包含大量 tile 参数（`wi_tile_*`, `wo_tile_*`）用于优化 quantized matmul 的切块大小。
+
+### 详细训练日志 - 4x4x8 bf16 (128 chips, 2026-02-06)
 
 | Step | 耗时 (s) | TFLOP/s/device | TFLOP/s/chip | Tokens/s/chip | Loss |
 |------|---------|----------------|--------------|---------------|------|
@@ -112,6 +153,19 @@
 - fsdp_shard_on_exp: False
 - use_2d_fsdp_sharding: True
 
+### fp8 配置关键参数 (4x4x8)
+
+**与 bf16 相同的参数**: per_device_batch_size, max_target_length, attention, remat_policy 等
+
+**fp8 特有参数:**
+- quantization: fp8_full
+- use_qwix_quantization: True
+- weight_quantization_calibration_method: fixed,-224,224
+- act_quantization_calibration_method: fixed,-224,224
+- wi_tile_* / wo_tile_*: 共 24 个 tile 参数，控制 quantized matmul 的切块大小
+- ici_fsdp_transpose_parallelism: 1 (与 bf16 4x4x8 相同)
+- fsdp_shard_on_exp: True
+
 ## 目录结构
 
 ```
@@ -127,7 +181,10 @@ deepseek3-671b/
 │       ├── README.md                      # 官方使用说明
 │       ├── run_recipe.sh                  # 官方原版脚本
 │       └── submit_deepseek3_4x8x8.sh     # 自定义提交脚本
-├── 4k-fp8-tpu7x-4x4x8/                   # fp8 精度, 4x4x8（待测试）
+├── 4k-fp8-tpu7x-4x4x8/                   # fp8 精度, 4x4x8 ✅ 已测试
+│   └── xpk/
+│       ├── run_recipe.sh                  # 官方原版脚本
+│       └── submit_deepseek3_fp8.sh        # 自定义提交脚本
 └── 4k-fp8-tpu7x-4x8x8/                   # fp8 精度, 4x8x8（待测试）
 ```
 
