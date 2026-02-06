@@ -1,0 +1,112 @@
+#!/bin/bash
+
+# =============================================================================
+# Qwen3-235B Pretraining on TPU v7 (Ironwood) - Environment Setup Script
+# =============================================================================
+# This script sets up the training environment:
+#   - Builds and uploads Docker image (if needed)
+#   - Creates GKE cluster (if needed)
+#
+# Before running, copy this file and fill in your environment variables:
+#   cp setup_training_env.sh.template setup_training_env.sh
+#   nano setup_training_env.sh  # fill in your values
+#   chmod +x setup_training_env.sh
+#   ./setup_training_env.sh
+#
+# To submit workload, run: ./submit_workload.sh
+# =============================================================================
+
+set -e
+
+# --- Environment Variables (MUST be set before running) ---
+export PROJECT_ID=""                # Your GCP project ID, e.g. "my-gcp-project"
+export CLUSTER_NAME=""              # Your GKE cluster name, e.g. "my-v7x-training"
+export ZONE=""                      # GCP zone for TPU reservation, e.g. "us-central1-c"
+export RESERVATION_NAME=""          # TPU reservation name, e.g. "my-reservation-name"
+export BASE_OUTPUT_DIR=""           # GCS bucket for output, e.g. "gs://my-bucket"
+export CONTAINER_REGISTRY="gcr.io"  # Container registry
+export CLOUD_IMAGE_NAME="${USER}-qwen3-235b-a22b-runner"
+export WORKLOAD_IMAGE="${CONTAINER_REGISTRY}/${PROJECT_ID}/${CLOUD_IMAGE_NAME}"
+
+# Docker image build versions (from README)
+export MAXTEXT_VERSION="maxtext-tutorial-v1.5.0"
+export JAX_VERSION="0.8.2.dev20251215"
+export LIBTPU_VERSION="0.0.32.dev20251215+nightly"
+
+# --- Validate required variables ---
+for var in PROJECT_ID CLUSTER_NAME ZONE RESERVATION_NAME BASE_OUTPUT_DIR; do
+    if [ -z "${!var}" ]; then
+        echo "ERROR: ${var} is not set. Please edit this script and set all required variables."
+        exit 1
+    fi
+done
+
+# Working directory for MaxText clone
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MAXTEXT_DIR="$HOME/maxtext"
+
+# --- Step 1: Build Docker Image (if not exists) ---
+echo "=========================================="
+echo "Step 1: Building Docker Image (if needed)"
+echo "=========================================="
+
+# Check if image exists in GCR
+if gcloud container images describe ${WORKLOAD_IMAGE}:latest &>/dev/null; then
+    echo "Image ${WORKLOAD_IMAGE}:latest already exists, skipping build."
+else
+    echo "Image not found. Building ${WORKLOAD_IMAGE}..."
+
+    # Clone MaxText if not exists
+    if [ ! -d "${MAXTEXT_DIR}" ]; then
+        echo "Cloning MaxText repository..."
+        git clone https://github.com/AI-Hypercomputer/maxtext.git "${MAXTEXT_DIR}"
+    fi
+
+    # Checkout to the correct version
+    cd "${MAXTEXT_DIR}"
+    echo "Checking out ${MAXTEXT_VERSION}..."
+    git fetch --all --tags
+    git checkout ${MAXTEXT_VERSION}
+
+    # Build the dependency image
+    echo "Building dependency image (this may take a while)..."
+    bash dependencies/scripts/docker_build_dependency_image.sh \
+        MODE=nightly \
+        JAX_VERSION=${JAX_VERSION} \
+        LIBTPU_VERSION=${LIBTPU_VERSION}
+
+    # Upload the runner image
+    echo "Uploading runner image to ${WORKLOAD_IMAGE}..."
+    bash dependencies/scripts/docker_upload_runner.sh CLOUD_IMAGE_NAME=${CLOUD_IMAGE_NAME}
+
+    # Return to script directory
+    cd "${SCRIPT_DIR}"
+
+    echo "Docker image built and uploaded successfully!"
+fi
+
+# --- Step 2: Create GKE Cluster (if not exists) ---
+echo "=========================================="
+echo "Step 2: Creating GKE Cluster (if needed)"
+echo "=========================================="
+
+# Check if cluster exists
+if gcloud container clusters describe ${CLUSTER_NAME} --project=${PROJECT_ID} --zone=${ZONE} &>/dev/null; then
+    echo "Cluster ${CLUSTER_NAME} already exists, skipping creation."
+else
+    echo "Creating cluster ${CLUSTER_NAME}..."
+    xpk cluster create \
+      --cluster=${CLUSTER_NAME} \
+      --project=${PROJECT_ID} \
+      --zone=${ZONE} \
+      --tpu-type=tpu7x-4x8x8 \
+      --num-slices=1 \
+      --reservation=${RESERVATION_NAME}
+fi
+
+echo "=========================================="
+echo "Environment setup complete!"
+echo "=========================================="
+echo ""
+echo "To submit a training workload, run:"
+echo "  ./submit_workload.sh"

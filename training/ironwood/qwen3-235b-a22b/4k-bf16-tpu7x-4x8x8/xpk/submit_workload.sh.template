@@ -1,0 +1,182 @@
+#!/bin/bash
+# Qwen3-235B 训练任务提交脚本
+#
+# Before running, copy this file and fill in your environment variables:
+#   cp submit_workload.sh.template submit_workload.sh
+#   nano submit_workload.sh  # fill in your values
+#   chmod +x submit_workload.sh
+#   ./submit_workload.sh
+
+set -e
+
+# =============================================================================
+# 环境变量 (MUST be set before running)
+# =============================================================================
+export PROJECT_ID=""                    # Your GCP project ID, e.g. "my-gcp-project"
+export CLUSTER_NAME=""                  # Your GKE cluster name, e.g. "my-v7x-training"
+export ZONE=""                          # GCP zone, e.g. "us-central1-c"
+export BASE_OUTPUT_DIR=""               # GCS output path, e.g. "gs://my-bucket"
+export WORKLOAD_IMAGE=""                # Docker image, e.g. "gcr.io/my-project/my-runner"
+# 工作负载名称：用户名+模型名+时间戳，上限 26 字符前缀 + 日期后缀
+export WORKLOAD_NAME="$(printf "%.26s" "${USER//_/-}-qwen3-235b-a22b-4096-fsdp-4x8x8")-$(date +%Y%m%d-%H%M)"
+
+# --- Validate required variables ---
+for var in PROJECT_ID CLUSTER_NAME ZONE BASE_OUTPUT_DIR WORKLOAD_IMAGE; do
+    if [ -z "${!var}" ]; then
+        echo "ERROR: ${var} is not set. Please edit this script and set all required variables."
+        exit 1
+    fi
+done
+
+echo "=========================================="
+echo "Submitting Qwen3-235B Training Workload"
+echo "=========================================="
+echo "Workload Name: ${WORKLOAD_NAME}"
+echo "Docker Image: ${WORKLOAD_IMAGE}"
+echo "Output Dir: ${BASE_OUTPUT_DIR}"
+echo ""
+
+# =============================================================================
+# XLA Flags — 控制 XLA 编译器在 TPU 上的行为
+# 这些 flag 主要用于优化 MoE 模型在 TPU v7 (Ironwood) 上的性能
+# =============================================================================
+XLA_FLAGS=""
+# VMEM (Vector Memory) 限制，单位 KiB。61440 KiB = 60 MB
+# TPU v7 每个 core 有更大的 VMEM，调大可让编译器更好利用片上内存
+XLA_FLAGS+=" --xla_tpu_scoped_vmem_limit_kib=61440"
+# 以下 3 个 flag 启用 SparseCore 来 offload collective 通信操作 (AllGather/AllReduce)
+# SparseCore 是 TPU v5+ 的专用硬件，可以在不占用 TensorCore 的情况下执行通信
+XLA_FLAGS+=" --xla_tpu_enable_sparse_core_collective_offload_all_gather=true"
+XLA_FLAGS+=" --xla_tpu_enable_sparse_core_collective_offload_all_reduce=true"
+# 只用一个 SparseCore 处理 AllGather offload（减少资源竞争）
+XLA_FLAGS+=" --xla_tpu_use_single_sparse_core_for_all_gather_offload=true"
+# 启用所有实验性调度器特性，让编译器更激进地优化指令调度
+XLA_FLAGS+=" --xla_tpu_enable_all_experimental_scheduler_features=true"
+# 启用调度器内存压力追踪，避免 VMEM OOM
+XLA_FLAGS+=" --xla_tpu_enable_scheduler_memory_pressure_tracking=true"
+# Host 与 TPU 之间数据传输的重叠上限（更大的值 = 更多 overlap = 更高吞吐）
+XLA_FLAGS+=" --xla_tpu_host_transfer_overlap_limit=24"
+# 激进移除优化屏障 (opt barrier)，允许编译器更自由地重排指令
+XLA_FLAGS+=" --xla_tpu_aggressive_opt_barrier_removal=ENABLED"
+# 优先增加异步操作深度而非避免 stall，提升流水线效率
+XLA_FLAGS+=" --xla_lhs_prioritize_async_depth_over_stall=ENABLED"
+# 启用 AllGather 反向传播的流水线化
+XLA_FLAGS+=" --xla_tpu_enable_ag_backward_pipelining=true"
+# 以下 2 个 flag 允许编译器对循环中的操作进行更激进的链式优化
+XLA_FLAGS+=" --xla_should_allow_loop_variant_parameter_in_chain=ENABLED"
+XLA_FLAGS+=" --xla_should_add_loop_invariant_op_in_chain=ENABLED"
+# Host send/recv 最大并发数。100 = 允许更多 host-device 数据传输同时进行
+XLA_FLAGS+=" --xla_max_concurrent_host_send_recv=100"
+# 调度器共享内存限制比例。100% = 使用全部可用共享内存
+XLA_FLAGS+=" --xla_tpu_scheduler_percent_shared_memory_limit=100"
+# 延迟隐藏调度器重新运行次数。2 = 调度器多跑 2 轮来寻找更优的指令排列
+XLA_FLAGS+=" --xla_latency_hiding_scheduler_rerun=2"
+
+# =============================================================================
+# MaxText 参数 — 控制模型训练的所有配置
+# =============================================================================
+MAXTEXT_ARGS=""
+
+# --- 模型基础配置 ---
+MAXTEXT_ARGS+="model_name=qwen3-235b-a22b "            # 模型名称，对应 MaxText/configs/ 下的模型定义
+MAXTEXT_ARGS+="per_device_batch_size=16.0 "             # 每个 TPU device 的 batch size。可以是小数（gradient accumulation）
+MAXTEXT_ARGS+="max_target_length=4096 "                 # 最大序列长度。4096 = 4K context window
+MAXTEXT_ARGS+="skip_jax_distributed_system=True "       # 跳过 JAX 分布式初始化（使用 Pathways 替代）
+
+# --- 精度配置 ---
+MAXTEXT_ARGS+="dtype=bfloat16 "                         # 激活值精度。bf16 在 TPU 上性能最佳
+MAXTEXT_ARGS+="weight_dtype=float32 "                   # 权重精度。fp32 保证训练稳定性（master weights）
+
+# --- 优化器 ---
+MAXTEXT_ARGS+="opt_type=adamw "                         # 优化器类型。adamw = Adam with weight decay
+MAXTEXT_ARGS+="steps=20 "                               # 训练总步数。20 步用于性能基准测试，正式训练需调大
+
+# --- Profiler 配置 ---
+MAXTEXT_ARGS+="profiler=xplane "                        # Profiler 类型。xplane 生成 TensorBoard 可读的 trace
+MAXTEXT_ARGS+="profiler_steps=3 "                       # profiler 采集的步数。3 步足够分析性能瓶颈
+MAXTEXT_ARGS+="skip_first_n_steps_for_profiler=5 "      # 跳过前 N 步再开始 profiling。前几步是 JIT 编译，数据不准
+MAXTEXT_ARGS+="profile_periodically_period=10000 "      # 周期性 profiling 的间隔步数。10000 = 每 1 万步采一次
+
+# --- Checkpoint 配置 ---
+MAXTEXT_ARGS+="async_checkpointing=False "              # 异步 checkpoint。False = 同步保存（性能测试时关闭）
+MAXTEXT_ARGS+="enable_checkpointing=False "             # 是否启用 checkpoint。性能测试时关闭避免 I/O 干扰
+
+# --- 内存优化 (Rematerialization) ---
+MAXTEXT_ARGS+="remat_policy=custom "                    # 重计算策略。custom = 使用自定义 remat 配置而非全部重计算
+MAXTEXT_ARGS+="decoder_layer_input=offload "            # 将 decoder 层输入 offload 到 HBM/Host，释放 VMEM
+
+# --- MoE (Mixture of Experts) 配置 ---
+MAXTEXT_ARGS+="use_custom_sort_vjp=True "               # 使用自定义 sort VJP（反向传播梯度），优化 MoE routing
+MAXTEXT_ARGS+="use_random_routing=True "                 # 随机路由。True = top-k 之外的 token 随机分配给 expert
+MAXTEXT_ARGS+="fsdp_shard_on_exp=False "                # 是否在 expert 维度上做 FSDP 分片。False = 在其他维度分片
+MAXTEXT_ARGS+="megablox=False "                          # 是否使用 MegaBlox 库做 MoE。False = 使用其他实现
+MAXTEXT_ARGS+="sparse_matmul=True "                      # 使用稀疏矩阵乘法优化 MoE 的 expert 计算
+MAXTEXT_ARGS+="use_tokamax_gmm=True "                    # 使用 TokaMax GMM (Grouped Matrix Multiply) 内核
+MAXTEXT_ARGS+="use_tokamax_splash=True "                 # 使用 TokaMax Splash Attention 内核（TPU 优化）
+
+# --- Attention 配置 ---
+MAXTEXT_ARGS+="sa_use_fused_bwd_kernel=True "            # 使用融合的反向传播 attention kernel，减少内存和计算
+MAXTEXT_ARGS+="attention=flash "                         # Attention 类型。flash = Flash Attention，显著省内存
+# 前向传播 block 大小：控制 attention 的分块计算粒度
+MAXTEXT_ARGS+="sa_block_q=1024 "                         # Query block 大小（前向）。越大计算效率越高但用更多内存
+MAXTEXT_ARGS+="sa_block_kv=1024 "                        # KV block 大小（前向）
+MAXTEXT_ARGS+="sa_block_kv_compute=512 "                 # KV 实际计算的 block 大小（前向）。可小于 sa_block_kv
+# 反向传播 dKV block 大小
+MAXTEXT_ARGS+="sa_block_q_dkv=2048 "                     # Query block 大小（计算 dK/dV 的反向）
+MAXTEXT_ARGS+="sa_block_kv_dkv=2048 "                    # KV block 大小（计算 dK/dV 的反向）
+MAXTEXT_ARGS+="sa_block_kv_dkv_compute=1024 "            # KV 实际计算的 block 大小（dKV 反向）
+# 反向传播 dQ block 大小
+MAXTEXT_ARGS+="sa_block_q_dq=1024 "                      # Query block 大小（计算 dQ 的反向）
+MAXTEXT_ARGS+="sa_block_kv_dq=1024 "                     # KV block 大小（计算 dQ 的反向）
+# 内存布局：影响 TPU 上矩阵存储方式，选错会严重影响性能
+MAXTEXT_ARGS+="sa_q_layout=HEAD_DIM_MINOR "              # Q 布局。HEAD_DIM_MINOR = head dim 在最内层（列优先）
+MAXTEXT_ARGS+="sa_k_layout=SEQ_MINOR "                   # K 布局。SEQ_MINOR = 序列维度在最内层
+MAXTEXT_ARGS+="sa_v_layout=HEAD_DIM_MINOR "              # V 布局。HEAD_DIM_MINOR = head dim 在最内层
+
+# --- 并行策略 (FSDP + 数据并行) ---
+# DCN = Data Center Network（跨 slice 通信，带宽较低）
+MAXTEXT_ARGS+="dcn_pipeline_parallelism=1 "              # DCN 流水线并行度。1 = 不使用跨 slice 流水线并行
+MAXTEXT_ARGS+="dcn_data_parallelism=-1 "                 # DCN 数据并行度。-1 = 自动推断（= num_slices）
+# ICI = Inter-Chip Interconnect（slice 内芯片互联，带宽极高）
+MAXTEXT_ARGS+="ici_pipeline_parallelism=1 "              # ICI 流水线并行度。1 = 不使用 slice 内流水线并行
+MAXTEXT_ARGS+="ici_fsdp_transpose_parallelism=1 "        # ICI FSDP 转置并行度。用于优化 FSDP 通信模式
+MAXTEXT_ARGS+="ici_fsdp_parallelism=-1 "                 # ICI FSDP 并行度。-1 = 自动推断（用满 slice 内所有 chip）
+
+# --- 数据集配置 ---
+MAXTEXT_ARGS+="dataset_type=synthetic "                  # 数据集类型。synthetic = 合成数据（用于性能测试）
+MAXTEXT_ARGS+="dataset_path=gs://max-datasets-rogue "    # 数据集 GCS 路径（synthetic 模式下不实际使用）
+
+# --- 输出配置 ---
+MAXTEXT_ARGS+="base_output_directory=${BASE_OUTPUT_DIR} " # 输出根目录（checkpoint、profiler trace、日志）
+MAXTEXT_ARGS+="run_name=${WORKLOAD_NAME}"                 # 运行名称，用于区分不同实验
+
+# =============================================================================
+# 提交训练任务到 GKE
+# =============================================================================
+xpk workload create \
+  --cluster=$CLUSTER_NAME \
+  --project=$PROJECT_ID \
+  --zone=$ZONE \
+  --priority=very-high \
+  --max-restarts=0 \
+  --device-type=tpu7x-4x8x8 \
+  --num-slices=1 \
+  --docker-image="${WORKLOAD_IMAGE}" \
+  --enable-debug-logs \
+  --workload="${WORKLOAD_NAME}" \
+  --command="set -e && export ENABLE_PATHWAYS_PERSISTENCE='1' && \
+export LIBTPU_INIT_ARGS='${XLA_FLAGS}' && \
+export JAX_PLATFORMS='tpu,cpu' && export ENABLE_PJRT_COMPATIBILITY='true' && \
+python3 -m MaxText.train MaxText/configs/base.yml ${MAXTEXT_ARGS}"
+
+echo ""
+echo "=========================================="
+echo "Workload submitted!"
+echo "=========================================="
+echo ""
+echo "Monitor:"
+echo "  xpk workload list --cluster ${CLUSTER_NAME} --project ${PROJECT_ID} --zone ${ZONE}"
+echo ""
+echo "View logs:"
+echo "  kubectl get pods | grep ${WORKLOAD_NAME}"
+echo "  kubectl logs -f <POD_NAME>"
