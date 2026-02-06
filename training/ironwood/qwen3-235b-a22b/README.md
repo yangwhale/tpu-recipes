@@ -167,9 +167,11 @@ xpk cluster delete --cluster ${CLUSTER_NAME} \
 
 ### 我的测试记录
 
-| 日期 | 配置 | Precision | Step Time (s) | TFLOPs/s/device | TFLOPs/s/chip | Tokens/s/chip | Loss (final) | 备注 |
-|------|------|-----------|---------------|-----------------|---------------|---------------|-------------|------|
-| 2026-02-05 | 4k-bf16-4x8x8 | bf16 | 31.60 | 307.1 | 614.3 | 4,140.6 | 12.034 | 首次测试，20 steps，与官方基线吻合 |
+| 日期 | 模型 | 配置 | Precision | Step Time (s) | TFLOPs/s/device | TFLOPs/s/chip | Tokens/s/chip | Loss (final) | 备注 |
+|------|------|------|-----------|---------------|-----------------|---------------|---------------|-------------|------|
+| 2026-02-05 | Qwen3-235B | 4k-bf16-4x8x8 (256 chips) | bf16 | 31.60 | 307.1 | 614.3 | 4,140.6 | 12.034 | 20 steps，与官方基线吻合 |
+
+> DeepSeek3-671B 的测试记录请参见 [deepseek3-671b/README.md](../deepseek3-671b/README.md)
 
 ### 详细训练日志 (2026-02-05)
 
@@ -190,6 +192,7 @@ xpk cluster delete --cluster ${CLUSTER_NAME} \
 - **Step 11** 耗时 106s 是因为 profiler 正在采集 xplane trace 数据
 - **稳态性能 (Step 2+)**: ~31.6 s/step, ~614 TFLOP/s/chip, ~4,140 Tokens/s/chip
 - **对比官方基线**: Step Time 31.60 vs 31.58 (差距 < 0.1%)，性能一致
+
 
 ## XPK 使用经验
 
@@ -222,6 +225,13 @@ gcloud container node-pools list --cluster=${CLUSTER_NAME} --zone=${ZONE} --proj
 - `xpk cluster adapt` 的 `--num-slices` 最小值为 1，无法缩减到 0
 - `xpk cluster delete` 会删除整个集群，无法只删除 TPU node pool
 - 要"保留集群 + 释放 TPU"只能用 `gcloud container node-pools delete` 直接操作
+- `xpk cluster adapt` 在 v0.16.1 存在 `memory_limit` 属性缺失的 bug，可能导致 adapt 失败
+- 共享项目中 default VPC 的 IP 空间可能被耗尽，建议创建自定义 VPC：
+  ```bash
+  gcloud compute networks create <name> --subnet-mode=auto --mtu=8896
+  # 创建集群时指定：
+  xpk cluster create ... --custom-cluster-arguments='--network=<name> --subnetwork=<name>'
+  ```
 
 ## 目录结构
 
