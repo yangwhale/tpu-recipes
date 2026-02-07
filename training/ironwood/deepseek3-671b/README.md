@@ -23,6 +23,7 @@
 | 2026-02-06 | 4k-fp8-4x4x8 (128 chips) | fp8_full | 22.39 | 366.5 | 733.1 | 2,926.5 | 8.541 | 30 steps，fp8 量化，比 bf16 快 22% |
 | 2026-02-07 | 4k-fp8-4x8x8 (256 chips) | fp8_full | 22.02 | 372.7 | 745.3 | 2,976.0 | 9.702 | 30 steps，fp8 4x8x8，近乎线性扩展 |
 | 2026-02-07 | 4k-bf16-8x8x8 (512 chips) | bf16 | 49.70 | 165.1 | 330.2 | 1,318.6 | 10.940 | 30 steps，ici_data_parallelism=2，扩展效率低 ⚠️ |
+| 2026-02-07 | 2×4x8x8 multi-slice (512 chips) | bf16 | ~530 | ~4.7 | ~9.4 | ~37.5 | - | DCN 网络未就绪，性能严重异常 ❌ |
 
 ### 详细训练日志 - 8x8x8 bf16 (512 chips, 2026-02-07)
 
@@ -66,6 +67,67 @@ DeepSeek3-671B 在 8x8x8 (512 chips) 上的扩展效率显著低于预期：
 > - 被迫使用 `ici_data_parallelism=2` 来消化多余的设备，引入了 all-reduce 通信开销
 > - 结论：**DeepSeek3-671B 的 FSDP 并行上限为 512 devices (256 chips)**，超过此限需要其他并行策略（专家并行、张量并行或多 slice DCN）
 
+### Multi-Slice DCN 测试 - 2×4x8x8 (512 chips, 2026-02-07) ❌
+
+#### 测试动机
+
+8x8x8 单 slice 因 FSDP 分片上限导致 45% 效率损失。Multi-slice DCN 方案可以保持每个 slice 内的满血 FSDP 效率（fsdp=256, fsdp_transpose=2），仅在 slice 间通过 DCN 同步梯度。
+
+#### 配置
+
+- 拓扑：2 × tpu7x-4x8x8（2 slices × 256 chips = 512 chips）
+- `dcn_data_parallelism=2`（跨 2 个 slice 数据并行）
+- `dcn_pipeline_parallelism=1`
+- slice 内 ICI 布局与单 slice 4x8x8 完全一致
+
+#### HBM OOM 调试历程
+
+Multi-slice 训练使用 per-device 方式计算 HBM，TPU v7 每 chip 192GB 但有 2 个 TensorCore（device），所以每 device 只有 ~94.75GB（扣除系统保留）。
+
+| batch_size | HBM 使用 | HBM 限制 | 结果 |
+|-----------|---------|---------|------|
+| 8.0 | 102.62 GB | 94.75 GB | OOM (超 7.88G) |
+| 6.0 | 96.25 GB | 94.75 GB | OOM (超 1.50G) |
+| 5.0 | 79.30 GB | 94.75 GB | 编译通过 |
+
+注：添加了 `--xla_tpu_enable_scheduler_memory_pressure_tracking=true` 和 `--xla_latency_hiding_scheduler_rerun=2` XLA flags 优化显存调度，但 batch_size=8.0 和 6.0 仍然 OOM。最终 batch_size=5.0 成功编译。
+
+#### 性能结果
+
+| Step | 耗时 (s) | TFLOP/s/device | 说明 |
+|------|---------|----------------|------|
+| 0 | 134.545 | 38.1 | JIT 编译 |
+| 1 | 546.956 | 9.4 | DCN 通信严重阻塞 |
+| 2 | 526.438 | 9.7 | DCN 通信严重阻塞 |
+
+- 预期 step time ~27s，实际 ~530s（慢了 ~20x）
+- 预期 TFLOP/s/device ~300，实际 ~9.5（仅为预期的 3%）
+- XLA 日志中 `CopyToMemorySpace CrossDeviceSrc` 操作耗时 8m44s，确认瓶颈在 DCN 跨 slice 通信
+
+#### 根因分析 — 集群网络基础设施缺失
+
+对比 Google 内部正常运行的 multi-slice 集群（bodaborg）发现，chrisya 集群缺少关键网络配置：
+
+| 功能 | bodaborg (正常) | chrisya (异常) |
+|------|----------------|---------------|
+| Multi-networking | enableMultiNetworking: true | 未启用 |
+| 网卡 | 双 NIC（eth0 管理 + eth1 高速 DCN） | 单 NIC |
+| Dataplane | ADVANCED_DATAPATH (Dataplane V2 / Cilium) | LEGACY (kube-proxy) |
+| sliceControllerConfig | 已启用 | 未配置 |
+| 机器类型 | tpu7x-standard-4t | tpu7x-ultranet-4t |
+| MegaScale gRPC 接口 | 配置了 megascale_grpc_interface_prefixes | 未配置 |
+| TCP rmem 调优 | DaemonSet 设置 tcp_rmem | 未配置 |
+
+**关键发现**：
+1. Multi-slice DCN 通过 host-mediated gRPC（MegaScale 协议）通信，不是 chip-to-chip 直连
+2. 需要双网卡（eth0 管理流量，eth1 专用于 DCN 高速通信）
+3. `enableMultiNetworking` 和 `ADVANCED_DATAPATH` 是集群级配置，**创建后不可更改**，需要重建集群
+4. bodaborg 使用 `tpu7x-standard-4t`（非 ultranet），说明 iRDMA/ultranet 不是 multi-slice 的必要条件
+
+#### 结论
+
+Multi-slice DCN 训练需要集群级别的网络基础设施支持，不能在现有 chrisya 集群上简单启用。测试暂停，等待集群重建或新集群部署。
+
 ### 详细训练日志 - 4x8x8 fp8 (256 chips, 2026-02-07)
 
 | Step | 耗时 (s) | TFLOP/s/device | TFLOP/s/chip | Tokens/s/chip | Loss |
@@ -100,12 +162,14 @@ DeepSeek3-671B 在 8x8x8 (512 chips) 上的扩展效率显著低于预期：
 | 4x4x8 | 128 | fp8 | 22.39 | 733.1 | 2,926.5 | 374,752 | +22.5% (fp8) |
 | 4x8x8 | 256 | fp8 | 22.02 | 745.3 | 2,976.0 | 761,848 | +149% (fp8+扩展) |
 | 8x8x8 | 512 | bf16 | 49.70 | 330.2 | 1,318.6 | 675,123 | +121% (扩展效率低) ⚠️ |
+| 2×4x8x8 DCN | 512 | bf16 | ~530 | ~9.4 | ~37.5 | ~19,200 | DCN 网络未就绪 ❌ |
 
 > **关键结论**:
 > 1. **fp8 量化提升 ~23%**: 相同拓扑下，fp8 比 bf16 快 22-23%
 > 2. **128→256 chips 近乎线性扩展**: per-chip 性能不变（~1-2% 提升），总吞吐翻倍
 > 3. **组合效果**: fp8 + 4x8x8 相比 bf16 4x4x8 实现 149% 的吞吐提升（2.49x）
 > 4. **512 chips 扩展瓶颈**: 8x8x8 (512 chips) per-chip 效率仅为 4x8x8 的 54.6%，因为模型 tensor 维度限制 FSDP 分片上限为 512 devices，超出部分只能用低效的 ICI 数据并行
+> 5. **Multi-slice DCN 需要集群基础设施**: 2×4x8x8 测试因集群缺少 multi-networking、Dataplane V2、双网卡等关键配置而失败（530s/step vs 预期 27s），需要重建集群才能支持
 
 ### 详细训练日志 - 4x4x8 fp8 (128 chips, 2026-02-06)
 
@@ -282,13 +346,24 @@ deepseek3-671b/
 │       ├── run_recipe.sh                  # 官方原版脚本
 │       └── submit_deepseek3_fp8_4x8x8.sh # 自定义提交脚本
 ├── 4k-bf16-tpu7x-8x8x8/                  # bf16 精度, 8x8x8 ⚠️ 扩展效率低
+│   ├── k8s/
+│   │   ├── README.md                      # 官方 K8s 部署说明
+│   │   └── k8s_manifest.yaml              # 官方 K8s manifest
 │   └── xpk/
-│       ├── run_recipe.sh                  # 从 4x8x8 复制（参考用）
+│       ├── README.md                      # 官方使用说明
+│       ├── run_recipe.sh                  # 官方原版脚本
 │       └── submit_deepseek3_8x8x8.sh     # 自定义提交脚本 (ici_data_parallelism=2)
-└── 4k-bf16-tpu7x-8x8x16/                 # bf16 精度, 8x8x16（待测试）
+├── 4k-bf16-tpu7x-8x8x16/                 # bf16 精度, 8x8x16（待测试）
+│   ├── k8s/
+│   │   ├── README.md                      # 官方 K8s 部署说明
+│   │   └── k8s_manifest.yaml              # 官方 K8s manifest
+│   └── xpk/
+│       ├── README.md                      # 官方使用说明
+│       ├── run_recipe.sh                  # 官方原版脚本
+│       └── submit_deepseek3_8x8x16.sh    # 自定义提交脚本
+└── 4k-bf16-tpu7x-2x4x8x8/                # bf16 精度, 2×4x8x8 multi-slice DCN ❌ 集群不支持
     └── xpk/
-        ├── run_recipe.sh                  # 从 4x8x8 复制（参考用）
-        └── submit_deepseek3_8x8x16.sh    # 自定义提交脚本
+        └── submit_deepseek3_2x4x8x8.sh   # Multi-slice DCN 提交脚本（需集群重建）
 ```
 
 ## 注意事项
