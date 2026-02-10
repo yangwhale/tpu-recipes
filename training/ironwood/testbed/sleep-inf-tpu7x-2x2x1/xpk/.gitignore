@@ -1,0 +1,4 @@
+# User-specific scripts with sensitive environment variables (project ID, cluster name, etc.)
+# Use *.template files as starting point: cp xxx.template xxx && nano xxx
+setup_training_env.sh
+submit_workload.sh

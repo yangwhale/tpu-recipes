@@ -1,0 +1,70 @@
+#!/bin/bash
+# Sleep Infinity Testbed — TPU v7 2x2x1 单节点
+# 用途: 启动一个挂住的 MaxText 容器，kubectl exec 进去手动实验
+#
+# Before running, copy this file and fill in your environment variables:
+#   cp submit_workload.sh.template submit_workload.sh
+#   nano submit_workload.sh  # fill in your values
+#   chmod +x submit_workload.sh
+#   ./submit_workload.sh
+
+set -e
+
+# =============================================================================
+# 环境变量 (MUST be set before running)
+# =============================================================================
+export PROJECT_ID=""                    # Your GCP project ID, e.g. "my-gcp-project"
+export CLUSTER_NAME=""                  # Your GKE cluster name, e.g. "my-v7x-training"
+export ZONE=""                          # GCP zone, e.g. "us-central1-c"
+export WORKLOAD_IMAGE=""                # Docker image, e.g. "gcr.io/my-project/my-maxtext-runner"
+# 工作负载名称：用户名+标识+时间戳
+export WORKLOAD_NAME="$(printf "%.26s" "${USER//_/-}-sleep-inf-2x2x1")-$(date +%Y%m%d-%H%M)"
+
+# --- Validate required variables ---
+for var in PROJECT_ID CLUSTER_NAME ZONE WORKLOAD_IMAGE; do
+    if [ -z "${!var}" ]; then
+        echo "ERROR: ${var} is not set. Please edit this script and set all required variables."
+        exit 1
+    fi
+done
+
+echo "=========================================="
+echo "Submitting Sleep Infinity Testbed"
+echo "=========================================="
+echo "Workload Name: ${WORKLOAD_NAME}"
+echo "Docker Image:  ${WORKLOAD_IMAGE}"
+echo "Device Type:   tpu7x-2x2x1 (4 chips, single node)"
+echo ""
+
+# =============================================================================
+# 提交 sleep infinity 工作负载到 GKE
+# =============================================================================
+xpk workload create \
+  --cluster=$CLUSTER_NAME \
+  --project=$PROJECT_ID \
+  --zone=$ZONE \
+  --priority=very-high \
+  --max-restarts=0 \
+  --device-type=tpu7x-2x2x1 \
+  --num-slices=1 \
+  --docker-image="${WORKLOAD_IMAGE}" \
+  --enable-debug-logs \
+  --workload="${WORKLOAD_NAME}" \
+  --command="echo 'Pod is ready. Use kubectl exec to connect.' && sleep infinity"
+
+echo ""
+echo "=========================================="
+echo "Workload submitted!"
+echo "=========================================="
+echo ""
+echo "Connect to the pod:"
+echo "  kubectl get pods | grep ${WORKLOAD_NAME}"
+echo "  kubectl exec -it <POD_NAME> -- bash"
+echo ""
+echo "Inside the pod, you have access to:"
+echo "  - python3 -m MaxText.train (MaxText training)"
+echo "  - JAX / Flax / TPU libraries"
+echo "  - 4 TPU v7 chips (8 devices)"
+echo ""
+echo "Delete workload when done:"
+echo "  xpk workload delete --workload ${WORKLOAD_NAME} --cluster ${CLUSTER_NAME} --project ${PROJECT_ID} --zone ${ZONE}"
