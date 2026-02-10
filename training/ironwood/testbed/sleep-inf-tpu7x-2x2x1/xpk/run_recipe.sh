@@ -1,23 +1,5 @@
 #!/bin/bash
 
-# --- Environment Setup ---
-# This script requires uv and a Python 3.11 virtual environment with xpk installed.
-# If you haven't set up uv and the environment, please refer to the README.md.
-
-UV_VENV_PATH="${HOME}/.local/bin/venv"
-UV_PYTHON_VERSION="3.11"
-
-# Activate the virtual environment
-source "${UV_VENV_PATH}/bin/activate"
-
-# Check if xpk is installed in the venv
-if ! pip show xpk &> /dev/null; then
-    echo "xpk not found in the virtual environment. Please install it by running:"
-    echo "pip install xpk==0.16.1"
-    exit 1
-fi
-# --- End Environment Setup ---
-
 # --- Configuration ---
 # Before running this script, please modify the environment variables below
 # to match your specific GCP project and cluster setup.
