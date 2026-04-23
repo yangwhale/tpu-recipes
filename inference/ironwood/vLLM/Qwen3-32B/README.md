@@ -1,7 +1,7 @@
-# Serve Qwen3-Coder-480B-A35B-Instruct-FP8-Dynamic with vLLM on Ironwood TPU
+# Serve Qwen3-32B with vLLM on Ironwood TPU
 
 In this guide, we show how to serve
-[Qwen3-Coder-480B-A35B-Instruct-FP8-Dynamic](https://huggingface.co/Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8) on Ironwood (TPU7x).
+[Qwen3-32B](https://huggingface.co/Qwen/Qwen3-32B) on Ironwood (TPU7x).
 
 ## Install `gcloud cli`
 
@@ -68,7 +68,7 @@ following steps to enable the required features.
     ```bash
     gcloud container clusters update ${CLUSTER_NAME} \
       --location=${REGION} \
-      --workload-pool=PROJECT_ID.svc.id.goog
+      --workload-pool=$PROJECT_ID.svc.id.goog
     ```
 
     To enable in existing nodepool.
@@ -80,7 +80,7 @@ following steps to enable the required features.
     --workload-metadata=GKE_METADATA
     ```
 
-1. **Enable HTTP Load Balancing:** The cluster must have the
+2. **Enable HTTP Load Balancing:** The cluster must have the
     `HttpLoadBalancing` add-on enabled. This is typically enabled by default,
     but you can confirm or add it:
 
@@ -91,10 +91,11 @@ following steps to enable the required features.
       --update-addons=HttpLoadBalancing=ENABLED
     ```
 
-1. **Enable Gateway API:** Enable the Gateway API on the cluster to allow GKE
-    to manage Gateway resources.
-    Note: This step is optional and needed only if inference gateway will be used.
-    More details about the inference gateway can be found at [GKE Inference Gateway](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/about-gke-inference-gateway).
+3. **Enable Gateway API:** Enable the Gateway API on the cluster to allow GKE
+    to manage Gateway resources. Note: This step is optional and needed only if
+    inference gateway will be used. More details about the inference gateway can
+    be found at
+    [GKE Inference Gateway](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/about-gke-inference-gateway).
 
     ```bash
     gcloud container clusters update ${CLUSTER_NAME} \
@@ -126,7 +127,7 @@ following steps to enable the required features.
 ### Create nodepool
 
 1. **Create TPU v7 (Ironwood) nodepool**. If a node pool does not already exist
-create a node pool with a single TPU v7 node in 2x2x1 configuration.
+create a node pool with a single TPU v7 node in 1x1x1 configuration.
 
     ```bash
     gcloud container node-pools create ${NODEPOOL_NAME} \
@@ -136,7 +137,7 @@ create a node pool with a single TPU v7 node in 2x2x1 configuration.
       --num-nodes=1 \
       --reservation=${RESERVATION_NAME} \
       --reservation-affinity=specific \
-      --machine-type=tpu7x-standard-4t \
+      --machine-type=tpu7x-standard-1t \
       --cluster=${CLUSTER_NAME}
     ```
 
@@ -148,7 +149,7 @@ create a node pool with a single TPU v7 node in 2x2x1 configuration.
     gcloud container clusters get-credentials ${CLUSTER_NAME} --location=us-central1-c
     ```
 
-1. Generate a new
+2. Generate a new
     [Hugging Face token](https://huggingface.co/docs/hub/security-tokens) if you
     don't already have one (NOTE: ensure that you have access to the model on
     Hugging Face):
@@ -159,7 +160,7 @@ create a node pool with a single TPU v7 node in 2x2x1 configuration.
         permissions.
     4. Select **Generate a token**.
 
-1. Create a Kubernetes Secret for Hugging Face credentials
+3. Create a Kubernetes Secret for Hugging Face credentials
 
     ```bash
     export HF_TOKEN=YOUR_TOKEN
@@ -167,7 +168,11 @@ create a node pool with a single TPU v7 node in 2x2x1 configuration.
         --from-literal=hf_api_token=${HF_TOKEN}
     ```
 
-1. Save this yaml file as `vllm-tpu.yaml`
+4. Save this yaml file as `vllm-tpu.yaml`
+
+    **Note:** This config is for 1k/8k and 8k/1k workloads. If users want to run
+    a 1k/1k (other) workload, please change `max-model-len` and restart the
+    server.
 
     ```
     apiVersion: storage.k8s.io/v1
@@ -191,7 +196,7 @@ create a node pool with a single TPU v7 node in 2x2x1 configuration.
         - ReadWriteOnce
       resources:
         requests:
-          storage: 1000Gi
+          storage: 100Gi
     ---
     apiVersion: apps/v1
     kind: Deployment
@@ -209,26 +214,28 @@ create a node pool with a single TPU v7 node in 2x2x1 configuration.
         spec:
           nodeSelector:
             cloud.google.com/gke-tpu-accelerator: tpu7x
-            cloud.google.com/gke-tpu-topology: 2x2x1
+            cloud.google.com/gke-tpu-topology: 1x1x1
           containers:
           - name: vllm-tpu
-            image: vllm/vllm-tpu:nightly-ironwood-20260113-8424c78-df7e127
+            image: vllm/vllm-tpu:nightly-20260330-2f76400-8c0b626
             command: ["python3", "-m", "vllm.entrypoints.openai.api_server"]
             args:
             - --host=0.0.0.0
             - --port=8000
             - --seed=42
-            - --tensor-parallel-size=8
+            - --model=Qwen/Qwen3-32B
+            - --tensor-parallel-size=2
             - --data-parallel-size=1
             - --max-model-len=9216
-            - --download-dir=/data
-            - --max-num-batched-tokens=1028
-            - --max-num-seqs=128
-            - --no-enable-prefix-caching
-            - --model=Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8
+            - --max-num-batched-tokens=4096
+            - --max-num-seqs=135
+            - --gpu-memory-utilization=0.98
+            - --block-size=256
             - --kv-cache-dtype=fp8
+            - --no-enable-prefix-caching
             - --async-scheduling
-            - --gpu-memory-utilization=0.93
+            - '--additional_config={"quantization": {"qwix": {"rules": [{"module_path": ".*", "weight_qtype": "float8_e4m3fn", "act_qtype": "float8_e4m3fn"}]}}}'
+            - --download-dir=/data
             env:
             - name: HF_HOME
               value: /data
@@ -237,19 +244,17 @@ create a node pool with a single TPU v7 node in 2x2x1 configuration.
                 secretKeyRef:
                   name: hf-secret
                   key: hf_api_token
-            - name: TPU_BACKEND_TYPE
-              value: jax
-            - name: MODEL_IMPL_TYPE
-              value: vllm
-            - name: VLLM_DISABLE_SHARED_EXPERTS_STREAM
-              value: '1'
+            - name: LAYOUT_Q_PROJ_AS_NDH
+              value: "1"
+            - name: USE_BATCHED_RPA_KERNEL
+              value: "1"
             ports:
             - containerPort: 8000
             resources:
               limits:
-                google.com/tpu: '4'
+                google.com/tpu: '1'
               requests:
-                google.com/tpu: '4'
+                google.com/tpu: '1'
             readinessProbe:
               tcpSocket:
                 port: 8000
@@ -281,9 +286,10 @@ create a node pool with a single TPU v7 node in 2x2x1 configuration.
           protocol: TCP
           port: 8000
           targetPort: 8000
+
     ```
 
-1. Apply the vLLM manifest by running the following command
+5. Apply the vLLM manifest by running the following command
 
     ```bash
     kubectl apply -f vllm-tpu.yaml
@@ -300,17 +306,17 @@ create a node pool with a single TPU v7 node in 2x2x1 configuration.
     (APIServer pid=1) INFO:     Application startup complete.
     ```
 
-1. Serve the model by port-forwarding the service
+6. Serve the model by port-forwarding the service
 
     ```bash
     kubectl port-forward service/vllm-service 8000:8000
     ```
 
-1. Interact with the model using curl (from your workstation/laptop)
+7. Interact with the model using curl (from your workstation/laptop)
 
     ```bash
     curl http://localhost:8000/v1/completions -H "Content-Type: application/json" -d '{
-        "model": "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8",
+        "model": "Qwen/Qwen3-32B",
         "prompt": "San Francisco is a",
         "max_tokens": 7,
         "temperature": 0
@@ -351,7 +357,7 @@ post:[Scaling high-performance inference cost-effectively](https://cloud.google.
     kubectl apply -f https://github.com/kubernetes-sigs/gateway-api-inference-extension/raw/v1.0.0/config/crd/bases/inference.networking.x-k8s.io_inferenceobjectives.yaml
     ```
 
-1. Create the Gateway Resource
+2. Create the Gateway Resource
 
     This manifest creates an internal Gateway, which will provision an internal
     load balancer to act as the entry point for your inference requests.
@@ -373,7 +379,7 @@ post:[Scaling high-performance inference cost-effectively](https://cloud.google.
 
     Apply the manifest: `kubectl apply -f internal-gateway.yaml`
 
-1. Create the InferencePool
+3. Create the InferencePool
 
     This resource groups your vLLM pods (identified by the `app: vllm-tpu` label
     from `vllm-tpu.yaml`) and enables advanced, cache-aware routing.
@@ -387,7 +393,7 @@ post:[Scaling high-performance inference cost-effectively](https://cloud.google.
       oci://registry.k8s.io/gateway-api-inference-extension/charts/inferencepool
     ```
 
-1. Configure the HTTPRoute
+4. Configure the HTTPRoute
 
     This manifest links your `internal-gateway` to your `vllm-tpu-pool`. It
     routes all traffic from the gateway's `/v1/completions` path directly to the
@@ -416,25 +422,26 @@ post:[Scaling high-performance inference cost-effectively](https://cloud.google.
 
     Apply the manifest: `kubectl apply -f vllm-http-route.yaml`
 
-1. Validate the Inference Gateway
+5. Validate the Inference Gateway
 
     You must run these commands from a GCE VM inside the same VPC as your GKE
     cluster, or a long running pod in the same cluster.
 
-    > **Tip:** If you don't have a VM or existing pod, you can create a temporary debug pod:
->
+    > **Tip:** If you don't have a VM or existing pod, you can create a
+    > temporary debug pod:
+    >
     > ```bash
     > kubectl run debug-pod --image=curlimages/curl --restart=Never -- /bin/sh -c "sleep 3600"
     > ```
->
+    >
     > Then execute commands from inside it:
->
+    >
     > ```bash
     > kubectl exec -it debug-pod -- /bin/sh
     > ```
 
-    Get the Internal Gateway IP
-    (this may take a few minutes to become available):
+    Get the Internal Gateway IP (this may take a few minutes to become
+    available):
 
     ```bash
     export GW_IP=""
@@ -452,8 +459,8 @@ post:[Scaling high-performance inference cost-effectively](https://cloud.google.
     curl -X POST http://${GW_IP}/v1/completions \
     -H "Content-Type: application/json" \
     -d '{
-      "model": "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8",
-      "prompt": "What is Qwen3-Coder 480B?",
+      "model": "Qwen/Qwen3-32B",
+      "prompt": "What is Qwen3 32B?",
       "max_tokens": 50
     }'
     ```
@@ -464,30 +471,50 @@ post:[Scaling high-performance inference cost-effectively](https://cloud.google.
 
 ### (Optional) Benchmark via Service
 
-1. Execute a short benchmark against the server using:
+To benchmark the server, we use the InferenceX client from SemiAnalysisAI.
+Reference: <https://github.com/SemiAnalysisAI/InferenceX>.
+
+First, download the client code: `git clone https://github.com/SemiAnalysisAI/InferenceX.git`
+
+1. Execute a short benchmark against the server using one of the following
+    workloads.
+
+    #### Workload 1k/1k
+
+    Save the following manifest as `vllm-benchmark-1k1k.yaml` and apply it using
+    `kubectl apply -f vllm-benchmark-1k1k.yaml`.
 
     ```
     apiVersion: v1
     kind: Pod
     metadata:
-      name: vllm-bench
+      name: vllm-bench-1k1k
     spec:
       terminationGracePeriodSeconds: 60
       containers:
       - name: vllm-bench
-        image: vllm/vllm-tpu:nightly-ironwood-20260113-8424c78-df7e127
-        command: ["vllm"]
+        image: vllm/vllm-tpu:nightly-20260330-2f76400-8c0b626
+        command: ["/bin/bash", "-c"]
         args:
-        - bench
-        - serve
-        - --dataset-name=random
-        - --random-input-len=1024
-        - --random-output-len=8192
-        - --num-prompts=75
-        - --ignore-eos
-        - --host=vllm-service
-        - --port=8000
-        - --model=Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8
+        - |
+          git clone https://github.com/SemiAnalysisAI/InferenceX.git /ubench/inferencex && \
+          cd /ubench/inferencex && \
+          git checkout 89ce6098ef2bc4576a735c43f39c7d972b091cfc && \
+          python3 /ubench/inferencex/utils/bench_serving/benchmark_serving.py \
+            --backend=vllm \
+            --request-rate=inf \
+            --percentile-metrics='ttft,tpot,itl,e2el' \
+            --host=vllm-service \
+            --port=8000 \
+            --model=Qwen/Qwen3-32B \
+            --tokenizer=Qwen/Qwen3-32B \
+            --dataset-name=random \
+            --random-input-len=1024 \
+            --random-output-len=1024 \
+            --random-range-ratio=0.8 \
+            --num-prompts=320 \
+            --max-concurrency=320 \
+            --ignore-eos
         env:
         - name: HUGGING_FACE_HUB_TOKEN
           valueFrom:
@@ -496,17 +523,102 @@ post:[Scaling high-performance inference cost-effectively](https://cloud.google.
               name: hf-secret
     ```
 
-Save this file as `vllm-benchmark.yaml`, then apply it using `kubectl apply -f
-vllm-benchmark.yaml`.
+    #### Workload 1k/8k
 
-1. Check the progress of benchmark:
+    Save the following manifest as `vllm-benchmark-1k8k.yaml` and apply it using
+    `kubectl apply -f vllm-benchmark-1k8k.yaml`.
 
     ```
-    $ kubectl logs -f vllm-bench
+    apiVersion: v1
+    kind: Pod
+    metadata:
+      name: vllm-bench-1k8k
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+      - name: vllm-bench
+        image: vllm/vllm-tpu:nightly-20260330-2f76400-8c0b626
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          git clone https://github.com/SemiAnalysisAI/InferenceX.git /ubench/inferencex && \
+          cd /ubench/inferencex && \
+          git checkout 89ce6098ef2bc4576a735c43f39c7d972b091cfc && \
+          python3 /ubench/inferencex/utils/bench_serving/benchmark_serving.py \
+            --backend=vllm \
+            --request-rate=inf \
+            --percentile-metrics='ttft,tpot,itl,e2el' \
+            --host=vllm-service \
+            --port=8000 \
+            --model=Qwen/Qwen3-32B \
+            --tokenizer=Qwen/Qwen3-32B \
+            --dataset-name=random \
+            --random-input-len=1024 \
+            --random-output-len=8192 \
+            --random-range-ratio=0.8 \
+            --num-prompts=320 \
+            --max-concurrency=320 \
+            --ignore-eos
+        env:
+        - name: HUGGING_FACE_HUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              key: hf_api_token
+              name: hf-secret
+    ```
+
+    #### Workload 8k/1k
+
+    Save the following manifest as `vllm-benchmark-8k1k.yaml` and apply it using
+    `kubectl apply -f vllm-benchmark-8k1k.yaml`.
+
+    ```
+    apiVersion: v1
+    kind: Pod
+    metadata:
+      name: vllm-bench-8k1k
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+      - name: vllm-bench
+        image: vllm/vllm-tpu:nightly-20260330-2f76400-8c0b626
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          git clone https://github.com/SemiAnalysisAI/InferenceX.git /ubench/inferencex && \
+          cd /ubench/inferencex && \
+          git checkout 89ce6098ef2bc4576a735c43f39c7d972b091cfc && \
+          python3 /ubench/inferencex/utils/bench_serving/benchmark_serving.py \
+            --backend=vllm \
+            --request-rate=inf \
+            --percentile-metrics='ttft,tpot,itl,e2el' \
+            --host=vllm-service \
+            --port=8000 \
+            --model=Qwen/Qwen3-32B \
+            --tokenizer=Qwen/Qwen3-32B \
+            --dataset-name=random \
+            --random-input-len=8192 \
+            --random-output-len=1024 \
+            --random-range-ratio=0.8 \
+            --num-prompts=320 \
+            --max-concurrency=320 \
+            --ignore-eos
+        env:
+        - name: HUGGING_FACE_HUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              key: hf_api_token
+              name: hf-secret
+    ```
+
+2. Check the progress of benchmark:
+
+    ```
+    $ kubectl logs -f vllm-bench-1k1k # For 1k/1k workload
     …
     …
     ============ Serving Benchmark Result ============
-    Successful requests:                     75
+    Successful requests:                     320
     Failed requests:                         0
     Benchmark duration (s):                  xx
     Total input tokens:                      xxx
@@ -514,7 +626,7 @@ vllm-benchmark.yaml`.
     Request throughput (req/s):              xx
     Output token throughput (tok/s):         xxx
     Peak output token throughput (tok/s):    xxx
-    Peak concurrent requests:                75.00
+    Peak concurrent requests:                320.00
     Total Token throughput (tok/s):          xxx
     ---------------Time to First Token----------------
     Mean TTFT (ms):                          xxx
@@ -522,7 +634,7 @@ vllm-benchmark.yaml`.
     P99 TTFT (ms):                           xxx
     -----Time per Output Token (excl. 1st token)------
     Mean TPOT (ms):                          xxx
-    Median TPOT (ms):                       xxx
+    Median TPOT (ms):                        xxx
     P99 TPOT (ms):                           xxx
     ---------------Inter-token Latency----------------
     Mean ITL (ms):                           xxx
@@ -531,9 +643,22 @@ vllm-benchmark.yaml`.
     ==================================================
     ```
 
-1. Clean up
+    Workload | Output Token Throughput (tok/s) Per Chip
+    :------- | :---------------------------------------
+    1k/1k    | 6467.74
+    1k/8k    | 3958.72
+    8k/1k    | 1357.34
+
+    **Note**: These benchmark results are based on the `InferenceX` client. The
+    development team is continuously improving and optimizing performance; as such,
+    these results are subject to change, and improved or optimized figures may be
+    published in the future.
+
+3. Clean up
 
     ```
-    kubectl delete -f vllm-benchmark.yaml
+    kubectl delete -f vllm-benchmark-1k1k.yaml
+    kubectl delete -f vllm-benchmark-1k8k.yaml
+    kubectl delete -f vllm-benchmark-8k1k.yaml
     kubectl delete -f vllm-tpu.yaml
     ```

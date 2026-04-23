@@ -33,10 +33,10 @@ job:
     tag: v0.2.3
   pathways_proxy_image:
     repository: us-docker.pkg.dev/cloud-tpu-v2-images/pathways/proxy_server
-    tag: latest
+    tag: jax-0.8.0
   pathways_rm_image:
     repository: us-docker.pkg.dev/cloud-tpu-v2-images/pathways/server
-    tag: latest
+    tag: jax-0.8.0
 
 
 volumes:

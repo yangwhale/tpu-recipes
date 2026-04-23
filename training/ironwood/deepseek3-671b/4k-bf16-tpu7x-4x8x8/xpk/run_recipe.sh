@@ -13,7 +13,7 @@ source "${UV_VENV_PATH}/bin/activate"
 # Check if xpk is installed in the venv
 if ! pip show xpk &> /dev/null; then
     echo "xpk not found in the virtual environment. Please install it by running:"
-    echo "pip install xpk==0.16.1"
+    echo "pip install xpk==1.8.0"
     exit 1
 fi
 # --- End Environment Setup ---
@@ -28,6 +28,7 @@ export PROJECT_ID=""
 export CLUSTER_NAME=""
 export ZONE=""
 export BASE_OUTPUT_DIR=""
+export ARTIFACT_DIR="${BASE_OUTPUT_DIR}"
 export WORKLOAD_IMAGE=""
 export WORKLOAD_NAME="$(printf "%.26s" "${USER//_/-}-deepseekv3-671b-4096-fsdp")-$(date +%Y%m%d-%H%M)"
 
@@ -65,7 +66,7 @@ XLA_FLAGS=" \
 
 # MaxText Workload Overrides
 MAXTEXT_ARGS="\
-model_name=deepseek3-671b \
+model_name=deepseek3-671b-2dfsdp \
 per_device_batch_size=8.0 \
 max_target_length=4096 \
 dcn_pipeline_parallelism=1 \
@@ -84,7 +85,7 @@ use_random_routing=True \
 megablox=True \
 sparse_matmul=True \
 use_custom_sort_vjp=True \
-fsdp_shard_on_exp=False \
+shard_exp_on_fsdp=False \
 use_2d_fsdp_sharding=True \
 sa_use_fused_bwd_kernel=True \
 sa_block_q=2048 \
@@ -103,11 +104,13 @@ float32_weight_sum=False \
 use_tokamax_gmm=True \
 tokenizer_path=assets/tokenizer.mistral-v3 \
 dataset_type=synthetic \
-dataset_path=gs://max-datasets-rogue \
 enable_checkpointing=False \
 steps=30 \
 base_output_directory=${BASE_OUTPUT_DIR} \
-run_name=${WORKLOAD_NAME}"
+run_name=${WORKLOAD_NAME} \
+output_dir=${BASE_OUTPUT_DIR}"
+
+
 
 xpk workload create \
   --cluster=$CLUSTER_NAME \
@@ -119,8 +122,14 @@ xpk workload create \
   --num-slices=1 \
   --docker-image="${WORKLOAD_IMAGE}" \
   --enable-debug-logs \
+   \
+   \
   --workload="${WORKLOAD_NAME}" \
-  --command="set -e && export ENABLE_PATHWAYS_PERSISTENCE='1' && \
+   \
+  --command="set -e && set -o pipefail && export ENABLE_PATHWAYS_PERSISTENCE='1' && \
 export LIBTPU_INIT_ARGS='${XLA_FLAGS}' && \
+export ARTIFACT_DIR='${ARTIFACT_DIR}' && \
 export JAX_PLATFORMS='tpu,cpu' && export ENABLE_PJRT_COMPATIBILITY='true' && \
-python3 -m MaxText.train MaxText/configs/base.yml ${MAXTEXT_ARGS}"
+ \
+python3 -m maxtext.trainers.pre_train.train maxtext/configs/base.yml ${MAXTEXT_ARGS} | tee train.log && \
+gsutil cp train.log ${BASE_OUTPUT_DIR}/${WORKLOAD_NAME}/logs/train-\${TPU_WORKER_ID}.log"

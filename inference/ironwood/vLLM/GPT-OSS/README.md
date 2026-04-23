@@ -135,6 +135,24 @@ create a node pool with a single TPU v7 node in 2x2x1 configuration.
       --cluster=${CLUSTER_NAME}
     ```
 
+1. **(Optional) Create TPU v7 flex-start nodepool**. Create a flex-start node pool that provisions a single TPU v7 node
+(2x2x1 topology) when a workload is submitted.
+
+    ```bash
+    gcloud container node-pools create ${NODEPOOL_NAME} \
+      --project=${PROJECT_ID} \
+      --location=${REGION} \
+      --node-locations=${ZONE} \
+      --machine-type=tpu7x-standard-4t \
+      --cluster=${CLUSTER_NAME} \
+      --reservation-affinity=none \
+      --enable-autoscaling \
+      --flex-start \
+      --num-nodes 0 \
+      --min-nodes=0 \
+      --max-nodes=1       
+    ```
+
 ## Deploy vLLM Workload on GKE
 
 1.  Configure kubectl to communicate with your cluster

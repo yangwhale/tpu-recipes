@@ -21,7 +21,7 @@ taskGroups:
             entrypoint: "/bin/sh"
             commands:
               - "-c"
-              - mkdir -p ${LOCAL_CKPT_BASE_PATH}/models/ && echo "Downloading model ${HF_MODEL_NAME}" && huggingface-cli download ${HF_MODEL_NAME} --local-dir ${LOCAL_CKPT_BASE_PATH}/models/fp8
+              - mkdir -p ${LOCAL_CKPT_BASE_PATH}/models/ && echo "Downloading model ${HF_MODEL_NAME}" && hf download ${HF_MODEL_NAME} --local-dir ${LOCAL_CKPT_BASE_PATH}/models/fp8
         # Run the conversion script
         - container:
             imageUri: ${ARTIFACT_REGISTRY}/${JETSTREAM_MAXTEXT_IMAGE}:${JETSTREAM_MAXTEXT_VERSION}

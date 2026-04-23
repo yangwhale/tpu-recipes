@@ -1,0 +1,17 @@
+services:
+  vllm-gemma4-26b-moe:
+    image: ${DOCKER_URI:-vllm/vllm-tpu:gemma4}
+    privileged: true
+    network_mode: host
+    shm_size: 16g
+    volumes:
+      - /dev/shm:/dev/shm
+      # Optional: Mount a local cache directory to avoid re-downloading weights
+      # - /path/to/local/hf/cache:/root/.cache/huggingface
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-<YOUR_HUGGING_FACE_TOKEN_PLACEHOLDER>}
+      - VLLM_ARGS= >
+          --model google/gemma-4-26B-A4B-it
+          --max-model-len 16384
+          --tensor-parallel-size 8
+          --disable_chunked_mm_input
