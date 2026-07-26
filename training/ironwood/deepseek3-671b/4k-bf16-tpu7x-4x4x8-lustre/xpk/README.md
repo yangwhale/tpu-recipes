@@ -5,6 +5,10 @@ This recipe outlines the steps for running a deepseek3-671b
 [Ironwood GKE clusters](https://cloud.google.com/kubernetes-engine) by using
 [XPK](https://github.com/AI-Hypercomputer/xpk) with Google Cloud Managed Lustre as the primary storage system for the dataset and checkpoints.
 
+If you prefer plain Kubernetes objects over the XPK wrapper — for example when
+handing the recipe to a customer who needs to read exactly what gets deployed —
+see the equivalent manifest-based recipe in [../k8s](../k8s/README.md).
+
 ## Workload Details
 
 This workload is configured with the following details:
