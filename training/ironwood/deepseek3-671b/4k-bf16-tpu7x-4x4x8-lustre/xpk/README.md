@@ -1,73 +1,70 @@
-# Instructions for training DeepSeek3-671B on TPU Ironwood (tpu7x-4x4x8) with Lustre
+# 在 TPU Ironwood (tpu7x-4x4x8) 上用 Lustre 训练 DeepSeek3-671B
 
-This recipe outlines the steps for running a deepseek3-671b
-[MaxText](https://github.com/AI-Hypercomputer/maxtext) pretraining workload on
-[Ironwood GKE clusters](https://cloud.google.com/kubernetes-engine) by using
-[XPK](https://github.com/AI-Hypercomputer/xpk) with Google Cloud Managed Lustre as the primary storage system for the dataset and checkpoints.
+本配方说明如何在 [Ironwood GKE 集群](https://cloud.google.com/kubernetes-engine)
+上通过 [XPK](https://github.com/AI-Hypercomputer/xpk) 运行 deepseek3-671b 的
+[MaxText](https://github.com/AI-Hypercomputer/maxtext) 预训练任务，并使用
+Google Cloud Managed Lustre 作为数据集和 checkpoint 的主存储。
 
-If you prefer plain Kubernetes objects over the XPK wrapper — for example when
-handing the recipe to a customer who needs to read exactly what gets deployed —
-see the equivalent manifest-based recipe in [../k8s](../k8s/README.md).
+如果你更希望用原生 Kubernetes 对象而不是 XPK 封装——比如要把配方交付给客户、
+需要对方能直接看懂到底部署了什么——请参考等价的 manifest 版本
+[../k8s](../k8s/README.md)。
 
-> 中文版：[README.zh-CN.md](README.zh-CN.md)
+> English version: [README.en.md](README.en.md)
 
-## Workload Details
+## 任务配置
 
-This workload is configured with the following details:
+本任务的配置如下：
 
--   Sequence Length: 4096
--   Precision: bf16
--   Chips: 128 (4x4x8 topology)
--   Lustre for dataset and checkpoints
-    -   C4 Multi-Lingual dataset (~12TB) with ArrayRecord format
+-   序列长度（Sequence Length）：4096
+-   精度：bf16
+-   芯片数：128（4x4x8 拓扑）
+-   数据集与 checkpoint 均使用 Lustre
+    -   C4 多语言数据集（约 12TB），ArrayRecord 格式
 
-## Relationship to the other recipes
+## 与其他配方的关系
 
-This recipe combines the 128-chip (4x4x8) parallelism configuration with the
-Lustre storage setup and the current MaxText runtime. It is derived from
-`4k-bf16-tpu7x-4x8x8-lustre`, with the following intentional differences:
+本配方把 128 芯片（4x4x8）的并行配置、Lustre 存储方案和当前版本的 MaxText 运行时
+组合到一起，派生自 `4k-bf16-tpu7x-4x8x8-lustre`，有意做了以下改动：
 
-| Setting | 4x8x8 (256 chips) | This recipe (128 chips) |
+| 配置项 | 4x8x8（256 芯片） | 本配方（128 芯片） |
 | --- | --- | --- |
 | `--tpu-type` | `tpu7x-4x8x8` | `tpu7x-4x4x8` |
 | `ici_fsdp_transpose_parallelism` | 2 | 1 |
 | `shard_exp_on_fsdp` | False | **True** |
-| `use_2d_fsdp_sharding` | True | not set (default False) |
+| `use_2d_fsdp_sharding` | True | 不设置（默认 False） |
 
-### Why the MoE sharding differs
+### 为什么 MoE 分片策略不同
 
-`use_2d_fsdp_sharding` shards the MoE weights across **both** the `fsdp` and
-`fsdp_transpose` axes. It is only meaningful when
-`ici_fsdp_transpose_parallelism > 1`, which is the case for 4x8x8 but not here.
+`use_2d_fsdp_sharding` 会把 MoE 权重**同时**切分到 `fsdp` 和 `fsdp_transpose`
+两个轴上。只有当 `ici_fsdp_transpose_parallelism > 1` 时这才有意义——4x8x8
+满足，本配方不满足。
 
-At 128 chips there are 256 devices on a single FSDP axis, so this recipe uses
-`shard_exp_on_fsdp=True` instead, sharding the expert dimension of the MLP
-weights along that single axis. MaxText requires `num_experts` to be divisible
-by `ici_fsdp_parallelism` for this path; DeepSeek V3 has 256 experts and
-`ici_fsdp_parallelism` resolves to 256, so the constraint holds. The same path
-additionally requires `ici_expert_parallelism = 1` and
-`ici_tensor_parallelism = 1`, both of which are the defaults here.
+在 128 芯片下只有一个 FSDP 轴（共 256 个 device），因此本配方改用
+`shard_exp_on_fsdp=True`，把 MLP 权重的 expert 维度切分到这个单轴上。
 
-Note that `shard_exp_on_fsdp` was named `fsdp_shard_on_exp` in older MaxText
-releases. The non-Lustre `4k-bf16-tpu7x-4x4x8` recipe still uses the old name
-together with the pre-refactor entrypoint (`python3 -m MaxText.train`); this
-recipe uses the current `src.maxtext.trainers.pre_train.train` entrypoint.
+MaxText 对该路径有硬性约束：`num_experts` 必须能被 `ici_fsdp_parallelism` 整除。
+DeepSeek V3 有 256 个 expert，此处 `ici_fsdp_parallelism` 解析为 256，约束成立。
+该路径还要求 `ici_expert_parallelism = 1` 且 `ici_tensor_parallelism = 1`，
+两者在本配方中都是默认值。
 
-All remaining MaxText arguments — `per_device_batch_size=8.0`,
-`max_target_length=4096`, `ici_fsdp_parallelism=-1`, `dcn_data_parallelism=-1`
-and the XLA flag set — are unchanged from the corresponding upstream recipes.
+注意 `shard_exp_on_fsdp` 在旧版 MaxText 中叫 `fsdp_shard_on_exp`。非 Lustre 的
+`4k-bf16-tpu7x-4x4x8` 配方仍在使用旧参数名和重构前的入口
+（`python3 -m MaxText.train`）；本配方使用当前的
+`src.maxtext.trainers.pre_train.train` 入口。
 
-## Prerequisites
+其余所有 MaxText 参数——`per_device_batch_size=8.0`、`max_target_length=4096`、
+`ici_fsdp_parallelism=-1`、`dcn_data_parallelism=-1` 以及整套 XLA flag——都与
+上游对应配方保持一致，未做修改。
 
-To run this recipe, you need the following:
+## 前置条件
 
--   **GCP Project Setup:** Ensure you have a GCP project with billing enabled
-    and are allowlisted for Ironwood access.
--   **User Project Permissions:** The account used requires the following IAM
-    Roles:
+运行本配方需要具备：
+
+-   **GCP 项目**：已开通计费，且已加入 Ironwood 访问白名单。
+-   **用户项目权限**：所用账号需要以下 IAM 角色：
     -   Artifact Registry Writer
     -   Compute Admin
-    -   Google Cloud Managed Lustre Admin 
+    -   Google Cloud Managed Lustre Admin
     -   Kubernetes Engine Admin
     -   Logging Admin
     -   Monitoring Admin
@@ -76,28 +73,23 @@ To run this recipe, you need the following:
     -   Vertex AI Administrator
     -   Service Usage Consumer
     -   TPU Viewer
--   **Docker:** Docker must be installed on your workstation. Follow the steps
-    in the [Install XPK and dependencies](#install-xpk-and-dependencies) section
-    to install Docker.
--   **Python 3.11 Virtual Environment:** A Python
-    3.11 virtual environment is required. Instructions
-    for setting this up are also in the
-    [Install XPK and dependencies](#install-xpk-and-dependencies) section.
--   **XPK and Dependencies:** Follow the steps in the
-    [Install XPK and dependencies](#install-xpk-and-dependencies) section to
-    install XPK, `kubectl`, `kubectl-kueue`, and `kubectl-kjob`.
+-   **Docker**：工作机上必须安装 Docker。安装步骤见
+    [安装 XPK 及依赖](#安装-xpk-及依赖) 一节。
+-   **Python 3.11 虚拟环境**：必须使用 Python 3.11 虚拟环境，配置方法同样见
+    [安装 XPK 及依赖](#安装-xpk-及依赖) 一节。
+-   **XPK 及依赖**：按 [安装 XPK 及依赖](#安装-xpk-及依赖) 一节的步骤安装 XPK、
+    `kubectl`、`kubectl-kueue` 和 `kubectl-kjob`。
 
+## 安装 XPK 及依赖
 
-## Install XPK and dependencies
+### XPK 与依赖安装
 
-### XPK and Dependency Installation
+#### Python 虚拟环境
 
-#### Virtual Python Environment
-
-Run the following to create a virtual Python environment:
+执行以下命令创建 Python 虚拟环境：
 
 ```bash
-# Set up uv
+# 安装 uv
 sudo apt update
 curl -LsSf https://astral.sh/uv/install.sh -o install-uv.sh
 chmod +x install-uv.sh
@@ -105,7 +97,7 @@ chmod +x install-uv.sh
 rm install-uv.sh
 source ${HOME}/.local/bin/env
 
-# Set up and Activate Python 3.11 virtual environment
+# 创建并激活 Python 3.11 虚拟环境
 uv venv --seed ${HOME}/.local/bin/venv --python 3.11 --clear
 source ${HOME}/.local/bin/venv/bin/activate
 pip install --upgrade pip
@@ -113,89 +105,81 @@ pip install --upgrade pip
 
 #### XPK
 
-Make sure you have the virtual environment activated when running XPK.
+运行 XPK 时务必确保虚拟环境处于激活状态。
 
-Install XPK and necessary tools:
+安装 XPK 和相关工具：
 
 ```bash
-# Install gcloud, if not already installed, https://cloud.google.com/sdk/docs/install
-# Install kubectl, if not already installed, https://cloud.google.com/kubernetes-engine/docs/how-to/cluster-access-for-kubectl#install_kubectl
+# 如未安装 gcloud，参考 https://cloud.google.com/sdk/docs/install
+# 如未安装 kubectl，参考 https://cloud.google.com/kubernetes-engine/docs/how-to/cluster-access-for-kubectl#install_kubectl
 
-# Ensure to log in to your gcloud
+# 确保已登录 gcloud
 
-# Install latest xpk
+# 安装 xpk
 pip install xpk==1.8.0
 
-# Install xpk pre-reqs kubectl-kueue and kjob (if you installed xpk via pip)
+# 安装 xpk 的前置依赖 kubectl-kueue 和 kjob（如果你是通过 pip 安装的 xpk）
 curl -LsSf https://raw.githubusercontent.com/AI-Hypercomputer/xpk/refs/tags/v1.8.0/tools/install-xpk.sh -o install-xpk.sh
 chmod +x install-xpk.sh
 sudo ./install-xpk.sh
 rm install-xpk.sh
 
-# Follow https://cloud.google.com/kubernetes-engine/docs/how-to/cluster-access-for-kubectl#install_plugin to install gke-gcloud-auth-plugin
+# 按 https://cloud.google.com/kubernetes-engine/docs/how-to/cluster-access-for-kubectl#install_plugin 安装 gke-gcloud-auth-plugin
 ```
 
 #### Docker
 
-Install Docker using instructions provided by your administrator. Once
-installed, run the following commands:
+按你所在组织管理员提供的方式安装 Docker。安装完成后执行：
 
 ```bash
-## Configure docker and test installation
+## 配置 docker 并验证安装
 gcloud auth configure-docker
-sudo usermod -aG docker $USER ## relaunch the terminal and make sure you have the virtual environment activated after running this command
-docker run hello-world # Test docker
+sudo usermod -aG docker $USER ## 执行后需重启终端，并确保重新激活虚拟环境
+docker run hello-world # 测试 docker
 ```
 
-## Orchestration and deployment tools
+## 编排与部署工具
 
-For this recipe, the following setup is used:
+本配方使用以下组合：
 
--   **Orchestration** -
+-   **编排** -
     [Google Kubernetes Engine (GKE)](https://cloud.google.com/kubernetes-engine)
--   **Pretraining job configuration and deployment** - XPK is used to configure
-    and deploy the
-    [Kubernetes Jobset](https://kubernetes.io/blog/2025/03/23/introducing-jobset)
-    resource, which manages the execution of the deepseek3-671b workload.
+-   **预训练任务配置与部署** - 使用 XPK 配置并部署
+    [Kubernetes JobSet](https://kubernetes.io/blog/2025/03/23/introducing-jobset)
+    资源，由它管理 deepseek3-671b 任务的执行。
 
-## Test environment
+## 测试环境
 
-This recipe is optimized for and tested with tpu7x-4x4x8.
+本配方针对 tpu7x-4x4x8 优化并验证。
 
--   **GKE cluster** To create your GKE cluster, use the XPK instructions.
-    [XPK instructions](https://github.com/AI-Hypercomputer/xpk?tab=readme-ov-file#cluster-create).
-    A sample command to create an XPK cluster is provided below.
+-   **GKE 集群**：创建 GKE 集群请参考
+    [XPK 文档](https://github.com/AI-Hypercomputer/xpk?tab=readme-ov-file#cluster-create)，
+    下面提供了一个示例命令。
 
-### Environment Variables for Cluster Creation
+### 集群创建所需的环境变量
 
-The environment variables required for cluster creation and workload execution
-are defined at the beginning of the `run_recipe.sh` script. **Before running the
-`xpk workload create` command**, please open `run_recipe.sh` and modify the
-`export` statements to set these variables to match your environment. It is
-crucial to use consistent values for `PROJECT_ID`, `CLUSTER_NAME`, and `ZONE`
-across all commands and configurations.
+集群创建和任务执行所需的环境变量定义在 `run_recipe.sh` 脚本开头。
+**在执行 `xpk workload create` 之前**，请先打开 `run_recipe.sh`，修改其中的
+`export` 语句以匹配你的环境。`PROJECT_ID`、`CLUSTER_NAME` 和 `ZONE` 在所有命令和
+配置中必须保持一致。
 
--   `PROJECT_ID`: Your GCP project name.
--   `CLUSTER_NAME`: The target cluster name.
--   `ZONE`: The zone for your cluster (e.g., `us-central1-c`).
--   `CONTAINER_REGISTRY`: The container registry to use (e.g., `gcr.io`).
--   `BASE_OUTPUT_DIR`: Output directory for model training (e.g.,
-    `"<your_lustre_instance>"`).
--   `MAXTEXT_ROOT`: The absolute path where you cloned the MaxText repository.
--   `WORKLOAD_IMAGE`: The Docker image for the workload. This is set in
-    `run_recipe.sh` to
-    `${CONTAINER_REGISTRY}/${PROJECT_ID}/${USER}-deepseek-v3-runner` by
-    default, matching the image built in the
-    [Docker container image](#docker-container-image) section.
--   `WORKLOAD_NAME`: A unique name for your workload. This is set in
-    `run_recipe.sh` using the following command:
+-   `PROJECT_ID`：你的 GCP 项目名。
+-   `CLUSTER_NAME`：目标集群名。
+-   `ZONE`：集群所在 zone（例如 `us-central1-c`）。
+-   `CONTAINER_REGISTRY`：使用的容器镜像仓库（例如 `gcr.io`）。
+-   `BASE_OUTPUT_DIR`：模型训练的输出目录（例如 `"<your_lustre_instance>"`）。
+-   `MAXTEXT_ROOT`：你 clone MaxText 仓库的绝对路径。
+-   `WORKLOAD_IMAGE`：任务使用的 Docker 镜像。`run_recipe.sh` 中默认设为
+    `${CONTAINER_REGISTRY}/${PROJECT_ID}/${USER}-deepseek-v3-runner`，与
+    [Docker 容器镜像](#docker-容器镜像) 一节构建的镜像对应。
+-   `WORKLOAD_NAME`：任务的唯一名称。`run_recipe.sh` 中通过以下命令生成：
     `export WORKLOAD_NAME="$(printf "%.26s" "${USER//_/-}-deepseekv3-671b-4096-fsdp")-$(date +%Y%m%d-%H%M)"`
--   `GKE_VERSION`: The GKE version, `1.34.0-gke.2201000` or later.
--   `RESERVATION_NAME`: Your TPU reservation name. Use the reservation name if
-    within the same project. For a shared project, use
-    `"projects/<project_number>/reservations/<reservation_name>"`.
+-   `GKE_VERSION`：GKE 版本，需 `1.34.0-gke.2201000` 或更高。
+-   `RESERVATION_NAME`：你的 TPU 预留（reservation）名称。同项目内直接用预留名；
+    跨项目共享时使用
+    `"projects/<project_number>/reservations/<reservation_name>"`。
 
-### Sample XPK Cluster Creation Command
+### XPK 集群创建示例命令
 
 ```bash
 xpk cluster create \
@@ -207,9 +191,10 @@ xpk cluster create \
   --reservation=${RESERVATION_NAME}
 ```
 
-### Enable Managed Lustre CSI Driver on Cluster
+### 在集群上启用 Managed Lustre CSI 驱动
 
-Ensure the GKE version is `1.34.0-gke.2201000` or later. If your GKE cluster is already created, ensure the Managed Lustre CSI driver is enabled.
+确保 GKE 版本为 `1.34.0-gke.2201000` 或更高。如果集群已经创建，需确认 Managed
+Lustre CSI 驱动已启用。
 
 ```bash
 gcloud container clusters update ${CLUSTER_NAME} \
@@ -218,23 +203,35 @@ gcloud container clusters update ${CLUSTER_NAME} \
   --update-addons=LustreCsiDriver=ENABLED
 ```
 
-## Lustre Instance Setup
+## Lustre 实例配置
 
-### Create Lustre Instance
+### 创建 Lustre 实例
 
-1. Create new Lustre instance following [instructions](https://docs.cloud.google.com/managed-lustre/docs/create-instance) to hold the dataset and checkpoints. Mount the Lustre instance on
+1. 按照[官方文档](https://docs.cloud.google.com/managed-lustre/docs/create-instance)
+创建新的 Lustre 实例，用于存放数据集和 checkpoint。挂载方式参考
 [Compute Engine](https://docs.cloud.google.com/managed-lustre/docs/connect-from-compute-engine)
-or
-[Kubernetes Engine](https://docs.cloud.google.com/managed-lustre/docs/lustre-csi-driver-new-volume). It is important to use the same network as the GKE cluster when creating the Lustre instance. Since the same instance will be used for both dataloading and checkpointing, at least 36 TB of storage is recommended.
+或
+[Kubernetes Engine](https://docs.cloud.google.com/managed-lustre/docs/lustre-csi-driver-new-volume)。
+**创建 Lustre 实例时必须使用与 GKE 集群相同的网络**。由于同一实例要同时承担数据
+加载和 checkpoint 写入，建议容量至少 36 TB。
 
-2. Prepare your dataset in the Lustre instance. This recipe is configured to use the Grain loader with ArrayRecord files. Ensure your dataset files are accessible in this instance. You would first need to download the AllenAI C4 dataset dataset from its source. Follow these [instructions](https://docs.cloud.google.com/managed-lustre/docs/transfer-data) to transfer the dataset to the Lustre instance.
+2. 在 Lustre 实例中准备数据集。本配方配置为使用 Grain loader 读取 ArrayRecord
+文件，需确保数据集文件在该实例中可访问。你需要先从数据源下载 AllenAI C4 数据集，
+然后按照[数据传输文档](https://docs.cloud.google.com/managed-lustre/docs/transfer-data)
+将其传输到 Lustre 实例。
 
-### Mount Lustre Instance
+### 挂载 Lustre 实例
 
-Managed Lustre lets you mount and access it as local file systems, so applications can read and write objects using standard file system semantics. You'll need to use the below commands to create [XPK storage resources](https://github.com/AI-Hypercomputer/xpk/blob/main/docs/usage/storage.md#managed-lustre) for the instance in order to mount it to the MaxText workload. For the lustre instance, use manifest file `lustre_pvc.yaml` from this repo.
-Be sure to update `volumeHandle` in the yamls with your correct lustre instance names. Creating a lustre instance and attaching xpk storage is a one time setup.
+Managed Lustre 可以像本地文件系统一样挂载访问，应用程序用标准文件系统语义即可
+读写。需要用下面的命令为该实例创建
+[XPK storage 资源](https://github.com/AI-Hypercomputer/xpk/blob/main/docs/usage/storage.md#managed-lustre)，
+才能把它挂载到 MaxText 任务中。Lustre 实例使用本仓库中的 `lustre_pvc.yaml`。
+
+注意要把 yaml 中的 `volumeHandle` 改成你实际的 Lustre 实例信息。创建 Lustre 实例
+和挂载 xpk storage 都是一次性配置。
+
 ```
-# Set variables
+# 设置变量
 export PROJECT=""
 export CLUSTER=""
 export ZONE=""
@@ -243,61 +240,60 @@ export ZONE=""
 xpk storage attach lustre-volume --type=lustre --project=$PROJECT --cluster=$CLUSTER --zone=$ZONE --mount-point=/mnt/lustre --readonly=false --auto-mount=false --manifest=lustre_pvc.yaml
 ```
 
-## Docker container image
+## Docker 容器镜像
 
-To build your own image, follow the steps linked in this section. If you don't
-have Docker installed on your workstation, see the section below for installing
-XPK and its dependencies. Docker installation is part of this process.
+构建自己的镜像请按本节步骤操作。如果工作机上还没装 Docker，参考前面
+安装 XPK 及依赖的章节，Docker 安装包含在其中。
 
-### Steps for building workload image
+### 构建任务镜像的步骤
 
-This recipe targets the **latest MaxText main branch**, which contains
-DeepSeek V3 MoE optimizations merged after the 4x8x8 recipe was pinned
-(commit `cf051eb03`, 2026-03-17). Notable changes since then include
-`Overlap moe comms with collective matmul`, `Fix ragged all-to-all with ragged
-buffer factor in DeepSeek-V3`, and `Enable MoE ragged sort on TPU7X`.
+本配方针对的是 **MaxText main 分支最新版**，其中包含了 4x8x8 配方固定版本
+（commit `cf051eb03`，2026-03-17）之后合入的 DeepSeek V3 MoE 优化。这期间值得
+关注的改动包括 `Overlap moe comms with collective matmul`、
+`Fix ragged all-to-all with ragged buffer factor in DeepSeek-V3`
+和 `Enable MoE ragged sort on TPU7X`。
 
-Recommended (latest):
+推荐（最新版）：
 
--   Maxtext version: `main` (verified against `e50e39458`, 2026-07-25)
--   Libtpu / Jax: latest nightly (resolved automatically by `MODE=nightly`)
--   Python: 3.11
--   XPK: 1.8.0
+-   MaxText 版本：`main`（已对照 `e50e39458`，2026-07-25 验证）
+-   Libtpu / Jax：最新 nightly（由 `MODE=nightly` 自动解析）
+-   Python：3.11
+-   XPK：1.8.0
 
-Known-good fallback (identical to the upstream 4x8x8 Lustre recipe) — use this
-if the latest main fails to build or regresses:
+已验证可用的回退版本（与上游 4x8x8 Lustre 配方完全一致）——如果最新 main 构建
+失败或出现性能回退，改用这组：
 
--   Maxtext version: `maxtext-tutorial-v1.1.0-1109-gcf051eb03`
--   Libtpu version: `0.0.35.dev20260121+nightly`
--   Jax version: `0.8.1`
+-   MaxText 版本：`maxtext-tutorial-v1.1.0-1109-gcf051eb03`
+-   Libtpu 版本：`0.0.35.dev20260121+nightly`
+-   Jax 版本：`0.8.1`
 
-Docker Image Building Command:
+Docker 镜像构建命令：
 
 ```bash
-export CONTAINER_REGISTRY="" # Initialize with your registry
+export CONTAINER_REGISTRY="" # 填入你的镜像仓库
 export CLOUD_IMAGE_NAME="${USER}-maxtext-runner"
 export WORKLOAD_IMAGE="${CONTAINER_REGISTRY}/${PROJECT_ID}/${CLOUD_IMAGE_NAME}"
 
-# Set up and Activate Python 3.11 virtual environment for Docker build
+# 为 Docker 构建创建并激活 Python 3.11 虚拟环境
 uv venv --seed ${HOME}/.local/bin/venv-docker --python 3.11 --clear
 source ${HOME}/.local/bin/venv-docker/bin/activate
 pip install --upgrade pip
 
-# Make sure you're running on a Virtual Environment with python 3.11
+# 确认当前虚拟环境是 Python 3.11
 if [[ "$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null)" == "3.11" ]]; then { echo "You have the correct Python version 3.11"; } else { >&2 echo "Error: Python version must be 3.11"; false;} fi
 
-# Clone MaxText Repository (latest main)
+# Clone MaxText 仓库（最新 main）
 git clone https://github.com/AI-Hypercomputer/maxtext.git
 cd maxtext
 
-# Record the exact commit you build from, so results stay reproducible
+# 记录本次构建所用的 commit，保证结果可复现
 git rev-parse HEAD
 
-# Build and upload the docker image.
-# MODE=nightly without explicit versions resolves the latest jax/libtpu nightly.
+# 构建并上传 docker 镜像。
+# MODE=nightly 不指定具体版本时会自动解析最新的 jax/libtpu nightly。
 bash src/dependencies/scripts/docker_build_dependency_image.sh MODE=nightly
 
-# --- Fallback: pin to the known-good versions used by the 4x8x8 recipe ---
+# --- 回退方案：固定到 4x8x8 配方使用的已验证版本 ---
 # git checkout maxtext-tutorial-v1.1.0-1109-gcf051eb03
 # bash src/dependencies/scripts/docker_build_dependency_image.sh \
 #   MODE=nightly \
@@ -305,64 +301,62 @@ bash src/dependencies/scripts/docker_build_dependency_image.sh MODE=nightly
 #   LIBTPU_VERSION=0.0.35.dev20260121+nightly
 bash src/dependencies/scripts/docker_upload_runner.sh CLOUD_IMAGE_NAME=${CLOUD_IMAGE_NAME}
 
-# Deactivate the virtual environment
+# 退出虚拟环境
 deactivate
 ```
 
-## Training dataset
+## 训练数据集
 
-This recipe uses the AllenAI C4 dataset with the [grain loader](https://github.com/google/grain). Ensure your dataset files are accessible in your Lustre instance following the instructions in the [Lustre Instance Setup](#lustre-instance-setup) section.
+本配方使用 AllenAI C4 数据集，通过
+[grain loader](https://github.com/google/grain) 读取。请按
+[Lustre 实例配置](#lustre-实例配置) 一节的说明，确保数据集文件在 Lustre 实例中
+可访问。
 
-## Run the recipe
+## 运行配方
 
-### Configure environment settings
+### 配置环境变量
 
-Before running any commands in this section, ensure you have set the environment
-variables as described in
-[Environment Variables for Cluster Creation](#environment-variables-for-cluster-creation).
+执行本节任何命令之前，请先按
+[集群创建所需的环境变量](#集群创建所需的环境变量) 一节设置好环境变量。
 
-### Connect to an existing cluster (Optional)
+### 连接到已有集群（可选）
 
-If you want to connect to your GKE cluster to see its current state before
-running the benchmark, you can use the following gcloud command. (Note that XPK
-does this for you already):
+如果想在跑 benchmark 前先连上 GKE 集群查看当前状态，可以用下面的 gcloud 命令
+（注意 XPK 会自动帮你做这一步）：
 
 ```bash
 gcloud container clusters get-credentials ${CLUSTER_NAME} --project ${PROJECT_ID} --zone ${ZONE}
 ```
 
-## Get the recipe
+## 获取配方
+
 ```bash
 cd ~
 git clone https://github.com/ai-hypercomputer/tpu-recipes.git
 cd tpu-recipes/training/ironwood/deepseek3-671b/4k-bf16-tpu7x-4x4x8-lustre/xpk
 ```
 
-### Run deepseek3-671b Pretraining Workload
+### 运行 deepseek3-671b 预训练任务
 
-The `run_recipe.sh` script contains all the necessary environment variables and
-configurations to launch the deepseek3-671b pretraining workload.
+`run_recipe.sh` 脚本包含了启动 deepseek3-671b 预训练任务所需的全部环境变量和配置。
 
-Before execution, use `nano ./run_recipe.sh` to edit the script and configure the environment variables to match your specific environment.
+执行前请用 `nano ./run_recipe.sh` 编辑脚本，把环境变量改成你自己的。
 
-### Configuring and Starting workload
+### 配置并启动任务
 
-From the MaxText root directory, start your DeepSeek3-671B workload.
+在 MaxText 根目录下启动 DeepSeek3-671B 任务。
 
-The `run_recipe.sh` script contains all the necessary environment variables and
-configurations to launch the deepseek3-671b pretraining workload.
-
-Edit the Recipe (run_recipe.sh) and populate the exported variables at the top of the file to match your environment.
+编辑 `run_recipe.sh`，填写文件顶部的 export 变量以匹配你的环境：
 
 ```
-# In run_recipe.sh, update these lines:
+# 在 run_recipe.sh 中修改这几行：
 export PROJECT_ID="your-project-id"
 export CLUSTER_NAME="your-cluster-name"
 export ZONE="your-zone"
-export DATASET_BUCKET_MOUNTED_PATH="/mnt/lustre/path-to-dataset-on-lustre-instance" # The path after /mnt/lustre/ should match the path to the dataset on the Lustre instance root
+export DATASET_BUCKET_MOUNTED_PATH="/mnt/lustre/path-to-dataset-on-lustre-instance" # /mnt/lustre/ 之后的路径要与数据集在 Lustre 实例根目录下的实际路径一致
 ```
 
-To configure and run the benchmark:
+配置并运行 benchmark：
 
 ```bash
 chmod +x run_recipe.sh
@@ -370,109 +364,97 @@ nano ./run_recipe.sh
 ./run_recipe.sh
 ```
 
-You can customize the run by modifying `run_recipe.sh`:
+可以通过修改 `run_recipe.sh` 来定制运行：
 
--   **Environment Variables:** Variables like `PROJECT_ID`, `CLUSTER_NAME`,
-    `ZONE`, `WORKLOAD_NAME`, `WORKLOAD_IMAGE`, and `BASE_OUTPUT_DIR` are defined
-    at the beginning of the script. Adjust these to match your environment.
--   **XLA Flags:** The `XLA_FLAGS` variable contains a set of XLA configurations
-    optimized for this workload. These can be tuned for performance or
-    debugging.
--   **MaxText Workload Overrides:** The `MAXTEXT_ARGS` variable holds the
-    arguments passed to the `python3 -m src.maxtext.trainers.pre_train.train` command. This
-    includes model-specific settings like `per_device_batch_size`,
-    `max_target_length`, and others. You can modify these to experiment with
-    different model configurations.
--   **Virtual Environment:** The script activates the virtual environment
-    created during the
-    [Install XPK and dependencies](#install-xpk-and-dependencies) steps. If you
-    used a different virtual environment, modify the `source` command at the top
-    of `run_recipe.sh`.
+-   **环境变量**：`PROJECT_ID`、`CLUSTER_NAME`、`ZONE`、`WORKLOAD_NAME`、
+    `WORKLOAD_IMAGE`、`BASE_OUTPUT_DIR` 等定义在脚本开头，按你的环境调整。
+-   **XLA Flags**：`XLA_FLAGS` 变量包含了一组针对本任务优化过的 XLA 配置，
+    可以用于性能调优或调试。
+-   **MaxText 参数覆盖**：`MAXTEXT_ARGS` 变量保存传给
+    `python3 -m src.maxtext.trainers.pre_train.train` 的参数，包含
+    `per_device_batch_size`、`max_target_length` 等模型相关配置，可以修改它们来
+    尝试不同的模型配置。
+-   **虚拟环境**：脚本会激活安装 XPK 时创建的虚拟环境。如果你用了别的虚拟环境，
+    请修改 `run_recipe.sh` 开头的 `source` 命令。
 
-Note that any MaxText configurations not explicitly overridden in `MAXTEXT_ARGS`
-are expected to use the defaults within the specified `WORKLOAD_IMAGE`.
+注意：`MAXTEXT_ARGS` 中未显式覆盖的 MaxText 配置，会使用指定 `WORKLOAD_IMAGE`
+中的默认值。
 
-## Monitor the job
+## 监控任务
 
-To monitor your job's progress, you can use kubectl to check the Jobset status
-and stream logs:
+可以用 kubectl 查看 JobSet 状态并跟踪日志：
 
 ```bash
 kubectl get jobset -n default ${WORKLOAD_NAME}
 
-# List pods to find the specific name (e.g., deepseek3-0-0-xxxx)
+# 列出 pod 找到具体名字（例如 deepseek3-0-0-xxxx）
 kubectl get pods | grep ${WORKLOAD_NAME}
 ```
-Then, stream the logs from the running pod (replace <POD_NAME> with the name you found):
+
+然后跟踪运行中 pod 的日志（把 <POD_NAME> 换成上面找到的名字）：
 
 ```bash
 kubectl logs -f <POD_NAME>
 ```
-You can also monitor your cluster and TPU usage through the Google Cloud
-Console.
 
-### Follow Workload and View Metrics
+也可以在 Google Cloud Console 上查看集群和 TPU 使用情况。
 
-After running `xpk workload create`, you will get a link to the Google Cloud
-Console to view your workload logs. Example: `[XPK] Follow your workload here:
+### 跟踪任务与查看指标
+
+执行 `xpk workload create` 之后，会返回一个 Google Cloud Console 链接用于查看
+任务日志。例如：`[XPK] Follow your workload here:
 https://console.cloud.google.com/kubernetes/service/${ZONE}/${PROJECT_ID}/default/${WORKLOAD_NAME}/details?project=${PROJECT_ID}`
-Alternatively, list workloads: (`xpk workload list`)
+
+也可以列出所有任务（`xpk workload list`）：
 
 ```bash
 xpk workload list --cluster ${CLUSTER_NAME} --project ${PROJECT_ID} --zone ${ZONE}
 ```
 
-For more in-depth debugging, use xpk inspector: (`xpk inspector`)
+需要更深入排查时使用 xpk inspector（`xpk inspector`）：
 
 ```bash
 xpk inspector --cluster ${CLUSTER_NAME} --project ${PROJECT_ID} --zone ${ZONE} [--workload ${WORKLOAD_NAME}]
 ```
 
-### Delete resources
+### 清理资源
 
-#### Delete a specific workload
+#### 删除指定任务
 
 ```bash
 xpk workload delete --workload ${WORKLOAD_NAME} --cluster ${CLUSTER_NAME} --project ${PROJECT_ID} --zone ${ZONE}
-# Or filter and delete:
+# 或按条件过滤删除：
 xpk workload delete --cluster ${CLUSTER_NAME} --project ${PROJECT_ID} --zone ${ZONE} --filter-by-job=${USER}
 ```
 
-#### Delete the XPK storage resource
+#### 删除 XPK storage 资源
 
 ```bash
 xpk storage detach lustre-volume --project ${PROJECT_ID} --cluster ${CLUSTER_NAME} --zone ${ZONE}
 ```
 
-#### Delete the entire XPK cluster
+#### 删除整个 XPK 集群
 
 ```bash
 xpk cluster delete --cluster ${CLUSTER_NAME} --zone ${ZONE} --project ${PROJECT_ID}
 ```
 
-## Check results
+## 查看结果
 
-After the job completes, you can check the results by:
+任务完成后，可以通过以下方式查看结果：
 
--   Accessing output logs from your job.
--   Checking the checkpoints and TensorBoard output under the `${BASE_OUTPUT_DIR}`
-    variable in your `run_recipe.sh` (`/mnt/lustre/checkpoints` on Lustre for
-    this recipe).
--   Reviewing metrics in Cloud Monitoring, if configured.
+-   查看任务的输出日志。
+-   查看 `run_recipe.sh` 中 `${BASE_OUTPUT_DIR}` 变量指定的目录（本配方指向
+    Lustre 上的 `/mnt/lustre/checkpoints`）下的 checkpoint 和 TensorBoard 输出。
+-   如果已配置，可在 Cloud Monitoring 中查看相关指标。
 
-## Next steps: deeper exploration and customization
+## 下一步：深入探索与定制
 
-This recipe is designed to provide a simple, reproducible "0-to-1" experience
-for running a MaxText pre-training workload. Its primary purpose is to help you
-verify your environment and achieve a first success with TPUs quickly and
-reliably.
+本配方的目标是提供一个简单、可复现的「从 0 到 1」体验，帮助你快速可靠地验证环境、
+在 TPU 上跑通第一次训练。
 
-For deeper exploration, including customizing model configurations, tuning
-performance with different XLA flags, and running custom experiments, we
-recommend using the benchmark_runner.py script directly from the MaxText
-repository. This script offers the full range of MaxText's flexibility and is
-the ideal tool for power users and researchers who want to move beyond the
-initial benchmark and tailor the workload to their specific needs. To learn
-more, see the
-[MaxText Benchmark Runner Guide](https://github.com/AI-Hypercomputer/maxtext/blob/main/benchmarks/Getting_Started_Benchmarking.md)
-on using benchmark_runner.py for advanced benchmarking.
+如果需要更深入的探索——比如定制模型配置、用不同的 XLA flag 调优性能、运行自定义
+实验——建议直接使用 MaxText 仓库中的 `benchmark_runner.py` 脚本。该脚本提供了
+MaxText 的完整灵活性，更适合希望超越初始 benchmark、按自身需求定制任务的高级用户
+和研究人员。详见
+[MaxText Benchmark Runner Guide](https://github.com/AI-Hypercomputer/maxtext/blob/main/benchmarks/Getting_Started_Benchmarking.md)。
