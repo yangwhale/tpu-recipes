@@ -1,9 +1,12 @@
-# 在 TPU Ironwood (tpu7x-4x4x8) 上用 Lustre 训练 DeepSeek3-671B
+# 在 TPU Ironwood (tpu7x-4x4x8) 上训练 DeepSeek3-671B（128 芯片 / 最新 MaxText）
 
 本配方说明如何在 [Ironwood GKE 集群](https://cloud.google.com/kubernetes-engine)
 上通过 [XPK](https://github.com/AI-Hypercomputer/xpk) 运行 deepseek3-671b 的
-[MaxText](https://github.com/AI-Hypercomputer/maxtext) 预训练任务，并使用
-Google Cloud Managed Lustre 作为数据集和 checkpoint 的主存储。
+[MaxText](https://github.com/AI-Hypercomputer/maxtext) 预训练任务。
+
+数据集使用 MaxText 内置的 synthetic 数据，**不需要任何外部存储**。目标是验证
+流程与性能，而不是训练出可用模型。需要真实数据集时见文末
+[改用 Lustre 存储](#附录改用-lustre-存储)。
 
 如果你更希望用原生 Kubernetes 对象而不是 XPK 封装——比如要把配方交付给客户、
 需要对方能直接看懂到底部署了什么——请参考等价的 manifest 版本
@@ -17,44 +20,67 @@ Google Cloud Managed Lustre 作为数据集和 checkpoint 的主存储。
 
 -   序列长度（Sequence Length）：4096
 -   精度：bf16
--   芯片数：128（4x4x8 拓扑）
--   数据集与 checkpoint 均使用 Lustre
-    -   C4 多语言数据集（约 12TB），ArrayRecord 格式
+-   芯片数：128（4x4x8 拓扑，32 个 VM × 4 芯片）
+-   数据集：synthetic（MaxText 内置，无外部依赖）
+-   Checkpoint：关闭
 
 ## 与其他配方的关系
 
-本配方把 128 芯片（4x4x8）的并行配置、Lustre 存储方案和当前版本的 MaxText 运行时
-组合到一起，派生自 `4k-bf16-tpu7x-4x8x8-lustre`，有意做了以下改动：
+上游的 `4k-bf16-tpu7x-4x4x8` 配方固定在重构前的 MaxText API，因此拿不到
+2026-03 之后合入的 DeepSeek V3 MoE 优化。本配方保持完全相同的 128 芯片并行
+配置，但改用当前的 MaxText main 分支运行时。
 
-| 配置项 | 4x8x8（256 芯片） | 本配方（128 芯片） |
+| | 上游 `4k-bf16-tpu7x-4x4x8` | 本配方 |
 | --- | --- | --- |
-| `--tpu-type` | `tpu7x-4x8x8` | `tpu7x-4x4x8` |
-| `ici_fsdp_transpose_parallelism` | 2 | 1 |
-| `shard_exp_on_fsdp` | False | **True** |
-| `use_2d_fsdp_sharding` | True | 不设置（默认 False） |
+| MaxText 入口 | `MaxText.train` | `src.maxtext.trainers.pre_train.train` |
+| config 路径 | `MaxText/configs/base.yml` | `src/maxtext/configs/base.yml` |
+| MoE 分片参数 | `fsdp_shard_on_exp=True` | `shard_exp_on_fsdp=True`（上游已重命名） |
+| XPK | 0.16.1 | 1.8.0 |
+| XLA | — | 增加 `--xla_tpu_dvfs_p_state=3` |
+| 并行配置 | 相同 | 相同 |
 
-### 为什么 MoE 分片策略不同
+### 为什么 MoE 分片用 `shard_exp_on_fsdp` 而不是 2D 分片
 
-`use_2d_fsdp_sharding` 会把 MoE 权重**同时**切分到 `fsdp` 和 `fsdp_transpose`
-两个轴上。只有当 `ici_fsdp_transpose_parallelism > 1` 时这才有意义——4x8x8
-满足，本配方不满足。
+256 芯片的 `4k-bf16-tpu7x-4x8x8-lustre` 配方使用
+`use_2d_fsdp_sharding=True` + `ici_fsdp_transpose_parallelism=2`。这条路径把
+MoE 权重同时切分到 `fsdp` 和 `fsdp_transpose` 两个轴上，只有当
+`ici_fsdp_transpose_parallelism > 1` 时才有意义。
 
-在 128 芯片下只有一个 FSDP 轴（共 256 个 device），因此本配方改用
-`shard_exp_on_fsdp=True`，把 MLP 权重的 expert 维度切分到这个单轴上。
+128 芯片下只有一个 FSDP 轴（共 256 个 device），因此本配方保持
+`ici_fsdp_transpose_parallelism=1` 并使用 `shard_exp_on_fsdp=True`。
 
-MaxText 对该路径有硬性约束：`num_experts` 必须能被 `ici_fsdp_parallelism` 整除。
-DeepSeek V3 有 256 个 expert，此处 `ici_fsdp_parallelism` 解析为 256，约束成立。
-该路径还要求 `ici_expert_parallelism = 1` 且 `ici_tensor_parallelism = 1`，
-两者在本配方中都是默认值。
+MaxText 对该路径有硬性约束：`num_experts` 必须能被 `ici_fsdp_parallelism`
+整除，且要求 `ici_expert_parallelism = 1`、`ici_tensor_parallelism = 1`。
+DeepSeek V3 有 256 个 expert，此处 `ici_fsdp_parallelism` 解析为 256，三个
+条件全部满足。**该约束已在 128 芯片实机上验证通过**。
 
-注意 `shard_exp_on_fsdp` 在旧版 MaxText 中叫 `fsdp_shard_on_exp`。非 Lustre 的
-`4k-bf16-tpu7x-4x4x8` 配方仍在使用旧参数名和重构前的入口
-（`python3 -m MaxText.train`）；本配方使用当前的
-`src.maxtext.trainers.pre_train.train` 入口。
+注意 `shard_exp_on_fsdp` 在旧版 MaxText 中叫 `fsdp_shard_on_exp`。
 
-其余所有 MaxText 参数——`per_device_batch_size=8.0`、`max_target_length=4096`、
-`ici_fsdp_parallelism=-1`、`dcn_data_parallelism=-1` 以及整套 XLA flag——都与
-上游对应配方保持一致，未做修改。
+## 验证状态
+
+2026-07-26 在 `us-central1-c` 的 128 芯片 Spot 节点池上实跑过（走的是
+[../k8s](../k8s/README.md) 的 manifest 路径，MaxText 参数与本配方一致）。
+
+已验证：4x4x8 节点池创建（32/32 Ready）、最新 MaxText main
+（`e50e39458`，2026-07-25）镜像构建、32 个 worker 全部启动、
+`shard_exp_on_fsdp=True` 通过配置校验、XLA 编译与前几个训练步。
+
+未验证：**稳态性能数据**（运行到 step 2 时 Spot 被抢占，step 0–1 属于 JIT
+编译阶段）；Lustre 存储路径（见附录）。
+
+## 性能参考
+
+以下为**同拓扑、同并行配置、synthetic 数据**下的历史数据，使用较旧的 MaxText
+（`maxtext-tutorial-v1.5.0`，JAX `0.8.2.dev20251215`），列出用于对照：
+
+| 配置 | 精度 | Step Time | TFLOP/s/chip | Tokens/s/chip |
+| --- | --- | --- | --- | --- |
+| 4x4x8（128 芯片） | bf16 | 27.00 s | 608.0 | 2,427.7 |
+| 4x4x8（128 芯片） | fp8 | 22.39 s | 733.1 | 2,926.5 |
+
+注意单位：MaxText 日志输出的 `TFLOP/s/device` 是 **per TensorCore**，TPU v7
+每 chip 有 2 个 TensorCore，per-chip 数值是日志值的 2 倍。上表已换算为
+per-chip。以 v7 每 chip BF16 峰值 2,307 TFLOPS 计，608 约合 26.4% MFU。
 
 ## 前置条件
 
@@ -179,6 +205,20 @@ docker run hello-world # 测试 docker
     跨项目共享时使用
     `"projects/<project_number>/reservations/<reservation_name>"`。
 
+### Placement policy（v7 必需）
+
+TPU v7 **不支持自动创建** placement policy。创建 multi-host 节点池前必须先建
+对应拓扑的 policy，否则节点池会创建出来但节点数为 0：
+
+```bash
+gcloud compute resource-policies create workload-policy tpu7x-128chip \
+  --region=${REGION} --project=${PROJECT_ID} \
+  --type=HIGH_THROUGHPUT --accelerator-topology=4x4x8
+```
+
+multi-host 节点池是 all-or-nothing 分配：32 台机器必须同时拿到，4x4x8 拓扑
+要求物理相邻的完整立方体。
+
 ### XPK 集群创建示例命令
 
 ```bash
@@ -203,43 +243,6 @@ gcloud container clusters update ${CLUSTER_NAME} \
   --update-addons=LustreCsiDriver=ENABLED
 ```
 
-## Lustre 实例配置
-
-### 创建 Lustre 实例
-
-1. 按照[官方文档](https://docs.cloud.google.com/managed-lustre/docs/create-instance)
-创建新的 Lustre 实例，用于存放数据集和 checkpoint。挂载方式参考
-[Compute Engine](https://docs.cloud.google.com/managed-lustre/docs/connect-from-compute-engine)
-或
-[Kubernetes Engine](https://docs.cloud.google.com/managed-lustre/docs/lustre-csi-driver-new-volume)。
-**创建 Lustre 实例时必须使用与 GKE 集群相同的网络**。由于同一实例要同时承担数据
-加载和 checkpoint 写入，建议容量至少 36 TB。
-
-2. 在 Lustre 实例中准备数据集。本配方配置为使用 Grain loader 读取 ArrayRecord
-文件，需确保数据集文件在该实例中可访问。你需要先从数据源下载 AllenAI C4 数据集，
-然后按照[数据传输文档](https://docs.cloud.google.com/managed-lustre/docs/transfer-data)
-将其传输到 Lustre 实例。
-
-### 挂载 Lustre 实例
-
-Managed Lustre 可以像本地文件系统一样挂载访问，应用程序用标准文件系统语义即可
-读写。需要用下面的命令为该实例创建
-[XPK storage 资源](https://github.com/AI-Hypercomputer/xpk/blob/main/docs/usage/storage.md#managed-lustre)，
-才能把它挂载到 MaxText 任务中。Lustre 实例使用本仓库中的 `lustre_pvc.yaml`。
-
-注意要把 yaml 中的 `volumeHandle` 改成你实际的 Lustre 实例信息。创建 Lustre 实例
-和挂载 xpk storage 都是一次性配置。
-
-```
-# 设置变量
-export PROJECT=""
-export CLUSTER=""
-export ZONE=""
-
-# Lustre PV/PVC
-xpk storage attach lustre-volume --type=lustre --project=$PROJECT --cluster=$CLUSTER --zone=$ZONE --mount-point=/mnt/lustre --readonly=false --auto-mount=false --manifest=lustre_pvc.yaml
-```
-
 ## Docker 容器镜像
 
 构建自己的镜像请按本节步骤操作。如果工作机上还没装 Docker，参考前面
@@ -247,70 +250,56 @@ xpk storage attach lustre-volume --type=lustre --project=$PROJECT --cluster=$CLU
 
 ### 构建任务镜像的步骤
 
-本配方针对的是 **MaxText main 分支最新版**，其中包含了 4x8x8 配方固定版本
-（commit `cf051eb03`，2026-03-17）之后合入的 DeepSeek V3 MoE 优化。这期间值得
-关注的改动包括 `Overlap moe comms with collective matmul`、
+本配方针对 **MaxText main 分支最新版**，其中包含了上游 4x8x8 配方固定版本
+（commit `cf051eb03`，2026-03-17）之后合入的 DeepSeek V3 MoE 优化，例如
+`Overlap moe comms with collective matmul`、
 `Fix ragged all-to-all with ragged buffer factor in DeepSeek-V3`
 和 `Enable MoE ragged sort on TPU7X`。
 
-推荐（最新版）：
-
--   MaxText 版本：`main`（已对照 `e50e39458`，2026-07-25 验证）
--   Libtpu / Jax：最新 nightly（由 `MODE=nightly` 自动解析）
--   Python：3.11
--   XPK：1.8.0
-
-已验证可用的回退版本（与上游 4x8x8 Lustre 配方完全一致）——如果最新 main 构建
-失败或出现性能回退，改用这组：
-
--   MaxText 版本：`maxtext-tutorial-v1.1.0-1109-gcf051eb03`
--   Libtpu 版本：`0.0.35.dev20260121+nightly`
--   Jax 版本：`0.8.1`
-
-Docker 镜像构建命令：
+已验证版本：MaxText `e50e39458`（2026-07-25），nightly jax/libtpu，
+Python 3.11，XPK 1.8.0。
 
 ```bash
-export CONTAINER_REGISTRY="" # 填入你的镜像仓库
-export CLOUD_IMAGE_NAME="${USER}-maxtext-runner"
-export WORKLOAD_IMAGE="${CONTAINER_REGISTRY}/${PROJECT_ID}/${CLOUD_IMAGE_NAME}"
+export CONTAINER_REGISTRY="" # 例如 us-docker.pkg.dev/${PROJECT_ID}/gcr.io
+export CLOUD_IMAGE_NAME="${USER}-maxtext-latest"
 
 # 为 Docker 构建创建并激活 Python 3.11 虚拟环境
 uv venv --seed ${HOME}/.local/bin/venv-docker --python 3.11 --clear
 source ${HOME}/.local/bin/venv-docker/bin/activate
 pip install --upgrade pip
 
-# 确认当前虚拟环境是 Python 3.11
-if [[ "$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null)" == "3.11" ]]; then { echo "You have the correct Python version 3.11"; } else { >&2 echo "Error: Python version must be 3.11"; false;} fi
-
-# Clone MaxText 仓库（最新 main）
 git clone https://github.com/AI-Hypercomputer/maxtext.git
 cd maxtext
 
 # 记录本次构建所用的 commit，保证结果可复现
 git rev-parse HEAD
 
-# 构建并上传 docker 镜像。
-# MODE=nightly 不指定具体版本时会自动解析最新的 jax/libtpu nightly。
+# 1. 构建依赖镜像（MODE=nightly 自动解析最新 jax/libtpu）
 bash src/dependencies/scripts/docker_build_dependency_image.sh MODE=nightly
 
-# --- 回退方案：固定到 4x8x8 配方使用的已验证版本 ---
-# git checkout maxtext-tutorial-v1.1.0-1109-gcf051eb03
-# bash src/dependencies/scripts/docker_build_dependency_image.sh \
-#   MODE=nightly \
-#   JAX_VERSION=0.8.1 \
-#   LIBTPU_VERSION=0.0.35.dev20260121+nightly
-bash src/dependencies/scripts/docker_upload_runner.sh CLOUD_IMAGE_NAME=${CLOUD_IMAGE_NAME}
+# 2. 构建 runner 镜像 —— 这一步才会把 MaxText 源码放进 /deps
+docker build --network host \
+  -f src/dependencies/dockerfiles/maxtext_runner.Dockerfile \
+  --build-arg BASEIMAGE=maxtext_base_image \
+  --build-arg PACKAGE_DIR=src \
+  -t maxtext_base_image__runner .
 
-# 退出虚拟环境
+# 3. 推送
+docker tag maxtext_base_image__runner:latest ${CONTAINER_REGISTRY}/${CLOUD_IMAGE_NAME}:runner
+docker push ${CONTAINER_REGISTRY}/${CLOUD_IMAGE_NAME}:runner
+
 deactivate
 ```
 
+**必须推 runner 镜像，不是 base 镜像。** `maxtext_base_image` 只含依赖，
+不含 MaxText 源码，用它跑会因为找不到模块而失败。
+
+仓库自带的 `docker_upload_runner.sh` 会用 `gcloud config get-value project`
+推送，跨项目使用时会推错地方，建议按上面的方式手动 tag 和 push。
+
 ## 训练数据集
 
-本配方使用 AllenAI C4 数据集，通过
-[grain loader](https://github.com/google/grain) 读取。请按
-[Lustre 实例配置](#lustre-实例配置) 一节的说明，确保数据集文件在 Lustre 实例中
-可访问。
+本配方使用 MaxText 内置的 synthetic 数据集，无需准备任何外部数据。
 
 ## 运行配方
 
@@ -333,7 +322,7 @@ gcloud container clusters get-credentials ${CLUSTER_NAME} --project ${PROJECT_ID
 ```bash
 cd ~
 git clone https://github.com/ai-hypercomputer/tpu-recipes.git
-cd tpu-recipes/training/ironwood/deepseek3-671b/4k-bf16-tpu7x-4x4x8-lustre/xpk
+cd tpu-recipes/training/ironwood/deepseek3-671b/4k-bf16-tpu7x-4x4x8-latest/xpk
 ```
 
 ### 运行 deepseek3-671b 预训练任务
@@ -353,7 +342,8 @@ cd tpu-recipes/training/ironwood/deepseek3-671b/4k-bf16-tpu7x-4x4x8-lustre/xpk
 export PROJECT_ID="your-project-id"
 export CLUSTER_NAME="your-cluster-name"
 export ZONE="your-zone"
-export DATASET_BUCKET_MOUNTED_PATH="/mnt/lustre/path-to-dataset-on-lustre-instance" # /mnt/lustre/ 之后的路径要与数据集在 Lustre 实例根目录下的实际路径一致
+export BASE_OUTPUT_DIR="gs://your-bucket/ds3-run"
+export WORKLOAD_IMAGE="your-registry/your-maxtext-latest:runner"
 ```
 
 配置并运行 benchmark：
@@ -444,9 +434,87 @@ xpk cluster delete --cluster ${CLUSTER_NAME} --zone ${ZONE} --project ${PROJECT_
 任务完成后，可以通过以下方式查看结果：
 
 -   查看任务的输出日志。
--   查看 `run_recipe.sh` 中 `${BASE_OUTPUT_DIR}` 变量指定的目录（本配方指向
-    Lustre 上的 `/mnt/lustre/checkpoints`）下的 checkpoint 和 TensorBoard 输出。
+-   查看 `run_recipe.sh` 中 `${BASE_OUTPUT_DIR}` 变量指定的目录下的
+    TensorBoard 输出（本配方关闭了 checkpoint）。
 -   如果已配置，可在 Cloud Monitoring 中查看相关指标。
+
+## 常见问题
+
+**`file:///deps does not appear to be a Python project`**
+
+runner 镜像的 `/deps` 下只有 `benchmarks/`、`src/`、`tests/`、`pytest.ini`，
+没有 `pyproject.toml` 或 `setup.py`，所以不要执行 `pip install -e .`。
+直接 `cd /deps` 后运行入口模块即可。
+
+**找不到 config**
+
+config 的正确路径是 `src/maxtext/configs/base.yml`。`/deps/maxtext` 这个目录
+不存在。
+
+**assets 路径相关报错**
+
+runner 镜像已经设好 `MAXTEXT_ASSETS_ROOT=/deps/src/maxtext/assets`
+（**小写** `maxtext`）和 `MAXTEXT_PKG_DIR`，不要在启动命令里手动 export 覆盖。
+旧配方里写的 `/deps/src/MaxText/assets`（大写）在当前镜像中不存在。
+
+**节点池创建后节点数为 0**
+
+检查 placement policy 是否存在且拓扑匹配。TPU v7 不支持自动创建 policy。
+
+## 附录：改用 Lustre 存储
+
+如果需要用真实数据集和 checkpoint，可以挂载 Google Cloud Managed Lustre。
+前提是 Lustre 实例与 GKE 集群在**同一个 VPC 网络**。
+
+### 1. 创建 Lustre 实例
+
+1. 按照[官方文档](https://docs.cloud.google.com/managed-lustre/docs/create-instance)
+创建新的 Lustre 实例，用于存放数据集和 checkpoint。挂载方式参考
+[Compute Engine](https://docs.cloud.google.com/managed-lustre/docs/connect-from-compute-engine)
+或
+[Kubernetes Engine](https://docs.cloud.google.com/managed-lustre/docs/lustre-csi-driver-new-volume)。
+**创建 Lustre 实例时必须使用与 GKE 集群相同的网络**。由于同一实例要同时承担数据
+加载和 checkpoint 写入，建议容量至少 36 TB。
+
+2. 在 Lustre 实例中准备数据集。本配方配置为使用 Grain loader 读取 ArrayRecord
+文件，需确保数据集文件在该实例中可访问。你需要先从数据源下载 AllenAI C4 数据集，
+然后按照[数据传输文档](https://docs.cloud.google.com/managed-lustre/docs/transfer-data)
+将其传输到 Lustre 实例。
+
+### 2. 挂载 Lustre 实例
+
+Managed Lustre 可以像本地文件系统一样挂载访问，应用程序用标准文件系统语义即可
+读写。需要用下面的命令为该实例创建
+[XPK storage 资源](https://github.com/AI-Hypercomputer/xpk/blob/main/docs/usage/storage.md#managed-lustre)，
+才能把它挂载到 MaxText 任务中。Lustre 实例的 PV/PVC 定义见 [../k8s/lustre_pvc.yaml](../k8s/lustre_pvc.yaml)。
+
+注意要把 yaml 中的 `volumeHandle` 改成你实际的 Lustre 实例信息。创建 Lustre 实例
+和挂载 xpk storage 都是一次性配置。
+
+```
+# 设置变量
+export PROJECT=""
+export CLUSTER=""
+export ZONE=""
+
+# Lustre PV/PVC
+xpk storage attach lustre-volume --type=lustre --project=$PROJECT --cluster=$CLUSTER --zone=$ZONE --mount-point=/mnt/lustre --readonly=false --auto-mount=false --manifest=../k8s/lustre_pvc.yaml
+```
+
+### 3. 修改 run_recipe.sh
+
+把 MaxText 参数中的
+
+```
+tokenizer_path=src/maxtext/assets/tokenizer.mistral-v3 dataset_type=synthetic enable_checkpointing=False
+```
+
+替换为 grain / checkpoint 相关参数，并在 `xpk workload create` 命令中加上
+`--storage=$LUSTRE_VOLUME_NAME`，同时把 `BASE_OUTPUT_DIR` 指向
+`/mnt/lustre/checkpoints`。完整参数见上游 256 芯片的
+`4k-bf16-tpu7x-4x8x8-lustre` 配方。
+
+**该路径尚未实机验证。**
 
 ## 下一步：深入探索与定制
 

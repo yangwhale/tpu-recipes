@@ -1,9 +1,14 @@
-# Instructions for training DeepSeek3-671B on TPU Ironwood (tpu7x-4x4x8) with Lustre
+# Training DeepSeek3-671B on TPU Ironwood (tpu7x-4x4x8) — 128 chips / latest MaxText
 
 This recipe outlines the steps for running a deepseek3-671b
 [MaxText](https://github.com/AI-Hypercomputer/maxtext) pretraining workload on
 [Ironwood GKE clusters](https://cloud.google.com/kubernetes-engine) by using
-[XPK](https://github.com/AI-Hypercomputer/xpk) with Google Cloud Managed Lustre as the primary storage system for the dataset and checkpoints.
+[XPK](https://github.com/AI-Hypercomputer/xpk).
+
+It uses MaxText's built-in synthetic dataset and needs **no external storage**.
+The goal is to validate the flow and measure performance, not to produce a
+usable model. For real data, see
+[Appendix: switching to Lustre](#appendix-switching-to-lustre).
 
 If you prefer plain Kubernetes objects over the XPK wrapper — for example when
 handing the recipe to a customer who needs to read exactly what gets deployed —
@@ -17,45 +22,69 @@ This workload is configured with the following details:
 
 -   Sequence Length: 4096
 -   Precision: bf16
--   Chips: 128 (4x4x8 topology)
--   Lustre for dataset and checkpoints
-    -   C4 Multi-Lingual dataset (~12TB) with ArrayRecord format
+-   Chips: 128 (4x4x8 topology, 32 VMs × 4 chips)
+-   Dataset: synthetic (built into MaxText, no external dependency)
+-   Checkpointing: disabled
 
 ## Relationship to the other recipes
 
-This recipe combines the 128-chip (4x4x8) parallelism configuration with the
-Lustre storage setup and the current MaxText runtime. It is derived from
-`4k-bf16-tpu7x-4x8x8-lustre`, with the following intentional differences:
+The upstream `4k-bf16-tpu7x-4x4x8` recipe is pinned to the pre-refactor MaxText
+API, so it cannot pick up the DeepSeek V3 MoE optimizations merged after
+2026-03. This recipe keeps the exact same 128-chip parallelism configuration but
+runs on the current MaxText main branch.
 
-| Setting | 4x8x8 (256 chips) | This recipe (128 chips) |
+| | upstream `4k-bf16-tpu7x-4x4x8` | This recipe |
 | --- | --- | --- |
-| `--tpu-type` | `tpu7x-4x8x8` | `tpu7x-4x4x8` |
-| `ici_fsdp_transpose_parallelism` | 2 | 1 |
-| `shard_exp_on_fsdp` | False | **True** |
-| `use_2d_fsdp_sharding` | True | not set (default False) |
+| MaxText entrypoint | `MaxText.train` | `src.maxtext.trainers.pre_train.train` |
+| Config path | `MaxText/configs/base.yml` | `src/maxtext/configs/base.yml` |
+| MoE sharding flag | `fsdp_shard_on_exp=True` | `shard_exp_on_fsdp=True` (renamed upstream) |
+| XPK | 0.16.1 | 1.8.0 |
+| XLA | — | adds `--xla_tpu_dvfs_p_state=3` |
+| Parallelism | same | same |
 
-### Why the MoE sharding differs
+### Why MoE sharding uses `shard_exp_on_fsdp` rather than 2D sharding
 
-`use_2d_fsdp_sharding` shards the MoE weights across **both** the `fsdp` and
-`fsdp_transpose` axes. It is only meaningful when
-`ici_fsdp_transpose_parallelism > 1`, which is the case for 4x8x8 but not here.
+The 256-chip `4k-bf16-tpu7x-4x8x8-lustre` recipe uses
+`use_2d_fsdp_sharding=True` with `ici_fsdp_transpose_parallelism=2`. That path
+shards MoE weights across both the `fsdp` and `fsdp_transpose` axes and is only
+meaningful when `ici_fsdp_transpose_parallelism > 1`.
 
-At 128 chips there are 256 devices on a single FSDP axis, so this recipe uses
-`shard_exp_on_fsdp=True` instead, sharding the expert dimension of the MLP
-weights along that single axis. MaxText requires `num_experts` to be divisible
-by `ici_fsdp_parallelism` for this path; DeepSeek V3 has 256 experts and
-`ici_fsdp_parallelism` resolves to 256, so the constraint holds. The same path
-additionally requires `ici_expert_parallelism = 1` and
-`ici_tensor_parallelism = 1`, both of which are the defaults here.
+At 128 chips there is a single FSDP axis of 256 devices, so this recipe keeps
+`ici_fsdp_transpose_parallelism=1` and uses `shard_exp_on_fsdp=True`.
 
-Note that `shard_exp_on_fsdp` was named `fsdp_shard_on_exp` in older MaxText
-releases. The non-Lustre `4k-bf16-tpu7x-4x4x8` recipe still uses the old name
-together with the pre-refactor entrypoint (`python3 -m MaxText.train`); this
-recipe uses the current `src.maxtext.trainers.pre_train.train` entrypoint.
+MaxText enforces hard constraints on this path: `num_experts` must be divisible
+by `ici_fsdp_parallelism`, and both `ici_expert_parallelism` and
+`ici_tensor_parallelism` must be 1. DeepSeek V3 has 256 experts and
+`ici_fsdp_parallelism` resolves to 256, so all three hold. **This has been
+verified on real 128-chip hardware.**
 
-All remaining MaxText arguments — `per_device_batch_size=8.0`,
-`max_target_length=4096`, `ici_fsdp_parallelism=-1`, `dcn_data_parallelism=-1`
-and the XLA flag set — are unchanged from the corresponding upstream recipes.
+Note that `shard_exp_on_fsdp` was named `fsdp_shard_on_exp` in older MaxText.
+
+## Validation status
+
+Run on a 128-chip Spot node pool in `us-central1-c` on 2026-07-26 (via the
+[../k8s](../k8s/README.en.md) manifest path; MaxText arguments are identical).
+
+Verified: 4x4x8 node pool creation (32/32 Ready), image build from MaxText main
+(`e50e39458`, 2026-07-25), all 32 workers started, `shard_exp_on_fsdp=True`
+passing config validation, XLA compilation and the first training steps.
+
+Not verified: **steady-state performance** (Spot preempted at step 2, and steps
+0–1 are JIT compilation); the Lustre storage path (see appendix).
+
+## Performance reference
+
+Historical data on the **same topology, same parallelism, synthetic dataset**,
+using an older MaxText (`maxtext-tutorial-v1.5.0`, JAX `0.8.2.dev20251215`):
+
+| Config | Precision | Step time | TFLOP/s/chip | Tokens/s/chip |
+| --- | --- | --- | --- | --- |
+| 4x4x8 (128 chips) | bf16 | 27.00 s | 608.0 | 2,427.7 |
+| 4x4x8 (128 chips) | fp8 | 22.39 s | 733.1 | 2,926.5 |
+
+Mind the units: MaxText logs `TFLOP/s/device` **per TensorCore**, and a TPU v7
+chip has 2 TensorCores, so per-chip values are 2× the logged value. Against a
+v7 per-chip BF16 peak of 2,307 TFLOPS, 608 is roughly 26.4% MFU.
 
 ## Prerequisites
 
@@ -195,6 +224,21 @@ across all commands and configurations.
     within the same project. For a shared project, use
     `"projects/<project_number>/reservations/<reservation_name>"`.
 
+### Placement policy (required for v7)
+
+TPU v7 **does not support auto-creating** placement policies. Create one for the
+target topology before creating a multi-host node pool, otherwise the pool is
+created but stays at 0 nodes:
+
+```bash
+gcloud compute resource-policies create workload-policy tpu7x-128chip \
+  --region=${REGION} --project=${PROJECT_ID} \
+  --type=HIGH_THROUGHPUT --accelerator-topology=4x4x8
+```
+
+Multi-host pools are allocated all-or-nothing: all 32 VMs must be obtained at
+once, since a 4x4x8 topology requires a physically contiguous cube.
+
 ### Sample XPK Cluster Creation Command
 
 ```bash
@@ -218,31 +262,6 @@ gcloud container clusters update ${CLUSTER_NAME} \
   --update-addons=LustreCsiDriver=ENABLED
 ```
 
-## Lustre Instance Setup
-
-### Create Lustre Instance
-
-1. Create new Lustre instance following [instructions](https://docs.cloud.google.com/managed-lustre/docs/create-instance) to hold the dataset and checkpoints. Mount the Lustre instance on
-[Compute Engine](https://docs.cloud.google.com/managed-lustre/docs/connect-from-compute-engine)
-or
-[Kubernetes Engine](https://docs.cloud.google.com/managed-lustre/docs/lustre-csi-driver-new-volume). It is important to use the same network as the GKE cluster when creating the Lustre instance. Since the same instance will be used for both dataloading and checkpointing, at least 36 TB of storage is recommended.
-
-2. Prepare your dataset in the Lustre instance. This recipe is configured to use the Grain loader with ArrayRecord files. Ensure your dataset files are accessible in this instance. You would first need to download the AllenAI C4 dataset dataset from its source. Follow these [instructions](https://docs.cloud.google.com/managed-lustre/docs/transfer-data) to transfer the dataset to the Lustre instance.
-
-### Mount Lustre Instance
-
-Managed Lustre lets you mount and access it as local file systems, so applications can read and write objects using standard file system semantics. You'll need to use the below commands to create [XPK storage resources](https://github.com/AI-Hypercomputer/xpk/blob/main/docs/usage/storage.md#managed-lustre) for the instance in order to mount it to the MaxText workload. For the lustre instance, use manifest file `lustre_pvc.yaml` from this repo.
-Be sure to update `volumeHandle` in the yamls with your correct lustre instance names. Creating a lustre instance and attaching xpk storage is a one time setup.
-```
-# Set variables
-export PROJECT=""
-export CLUSTER=""
-export ZONE=""
-
-# Lustre PV/PVC
-xpk storage attach lustre-volume --type=lustre --project=$PROJECT --cluster=$CLUSTER --zone=$ZONE --mount-point=/mnt/lustre --readonly=false --auto-mount=false --manifest=lustre_pvc.yaml
-```
-
 ## Docker container image
 
 To build your own image, follow the steps linked in this section. If you don't
@@ -251,67 +270,57 @@ XPK and its dependencies. Docker installation is part of this process.
 
 ### Steps for building workload image
 
-This recipe targets the **latest MaxText main branch**, which contains
-DeepSeek V3 MoE optimizations merged after the 4x8x8 recipe was pinned
-(commit `cf051eb03`, 2026-03-17). Notable changes since then include
-`Overlap moe comms with collective matmul`, `Fix ragged all-to-all with ragged
-buffer factor in DeepSeek-V3`, and `Enable MoE ragged sort on TPU7X`.
+This recipe targets the **latest MaxText main branch**, which contains DeepSeek
+V3 MoE optimizations merged after the upstream 4x8x8 recipe was pinned (commit
+`cf051eb03`, 2026-03-17) — for example `Overlap moe comms with collective
+matmul`, `Fix ragged all-to-all with ragged buffer factor in DeepSeek-V3`, and
+`Enable MoE ragged sort on TPU7X`.
 
-Recommended (latest):
-
--   Maxtext version: `main` (verified against `e50e39458`, 2026-07-25)
--   Libtpu / Jax: latest nightly (resolved automatically by `MODE=nightly`)
--   Python: 3.11
--   XPK: 1.8.0
-
-Known-good fallback (identical to the upstream 4x8x8 Lustre recipe) — use this
-if the latest main fails to build or regresses:
-
--   Maxtext version: `maxtext-tutorial-v1.1.0-1109-gcf051eb03`
--   Libtpu version: `0.0.35.dev20260121+nightly`
--   Jax version: `0.8.1`
-
-Docker Image Building Command:
+Verified with MaxText `e50e39458` (2026-07-25), nightly jax/libtpu, Python 3.11,
+XPK 1.8.0.
 
 ```bash
-export CONTAINER_REGISTRY="" # Initialize with your registry
-export CLOUD_IMAGE_NAME="${USER}-maxtext-runner"
-export WORKLOAD_IMAGE="${CONTAINER_REGISTRY}/${PROJECT_ID}/${CLOUD_IMAGE_NAME}"
+export CONTAINER_REGISTRY="" # e.g. us-docker.pkg.dev/${PROJECT_ID}/gcr.io
+export CLOUD_IMAGE_NAME="${USER}-maxtext-latest"
 
-# Set up and Activate Python 3.11 virtual environment for Docker build
 uv venv --seed ${HOME}/.local/bin/venv-docker --python 3.11 --clear
 source ${HOME}/.local/bin/venv-docker/bin/activate
 pip install --upgrade pip
 
-# Make sure you're running on a Virtual Environment with python 3.11
-if [[ "$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null)" == "3.11" ]]; then { echo "You have the correct Python version 3.11"; } else { >&2 echo "Error: Python version must be 3.11"; false;} fi
-
-# Clone MaxText Repository (latest main)
 git clone https://github.com/AI-Hypercomputer/maxtext.git
 cd maxtext
 
 # Record the exact commit you build from, so results stay reproducible
 git rev-parse HEAD
 
-# Build and upload the docker image.
-# MODE=nightly without explicit versions resolves the latest jax/libtpu nightly.
+# 1. Build the dependency image (MODE=nightly resolves the latest jax/libtpu)
 bash src/dependencies/scripts/docker_build_dependency_image.sh MODE=nightly
 
-# --- Fallback: pin to the known-good versions used by the 4x8x8 recipe ---
-# git checkout maxtext-tutorial-v1.1.0-1109-gcf051eb03
-# bash src/dependencies/scripts/docker_build_dependency_image.sh \
-#   MODE=nightly \
-#   JAX_VERSION=0.8.1 \
-#   LIBTPU_VERSION=0.0.35.dev20260121+nightly
-bash src/dependencies/scripts/docker_upload_runner.sh CLOUD_IMAGE_NAME=${CLOUD_IMAGE_NAME}
+# 2. Build the runner image — this is the step that puts MaxText into /deps
+docker build --network host \
+  -f src/dependencies/dockerfiles/maxtext_runner.Dockerfile \
+  --build-arg BASEIMAGE=maxtext_base_image \
+  --build-arg PACKAGE_DIR=src \
+  -t maxtext_base_image__runner .
 
-# Deactivate the virtual environment
+# 3. Push
+docker tag maxtext_base_image__runner:latest ${CONTAINER_REGISTRY}/${CLOUD_IMAGE_NAME}:runner
+docker push ${CONTAINER_REGISTRY}/${CLOUD_IMAGE_NAME}:runner
+
 deactivate
 ```
 
+**Push the runner image, not the base image.** `maxtext_base_image` contains
+only dependencies, not the MaxText source, and will fail with missing modules.
+
+The bundled `docker_upload_runner.sh` pushes to `gcloud config get-value
+project`, which targets the wrong project in cross-project setups — prefer
+tagging and pushing manually as above.
+
 ## Training dataset
 
-This recipe uses the AllenAI C4 dataset with the [grain loader](https://github.com/google/grain). Ensure your dataset files are accessible in your Lustre instance following the instructions in the [Lustre Instance Setup](#lustre-instance-setup) section.
+This recipe uses MaxText's built-in synthetic dataset. No external data
+preparation is required.
 
 ## Run the recipe
 
@@ -335,7 +344,7 @@ gcloud container clusters get-credentials ${CLUSTER_NAME} --project ${PROJECT_ID
 ```bash
 cd ~
 git clone https://github.com/ai-hypercomputer/tpu-recipes.git
-cd tpu-recipes/training/ironwood/deepseek3-671b/4k-bf16-tpu7x-4x4x8-lustre/xpk
+cd tpu-recipes/training/ironwood/deepseek3-671b/4k-bf16-tpu7x-4x4x8-latest/xpk
 ```
 
 ### Run deepseek3-671b Pretraining Workload
@@ -359,7 +368,8 @@ Edit the Recipe (run_recipe.sh) and populate the exported variables at the top o
 export PROJECT_ID="your-project-id"
 export CLUSTER_NAME="your-cluster-name"
 export ZONE="your-zone"
-export DATASET_BUCKET_MOUNTED_PATH="/mnt/lustre/path-to-dataset-on-lustre-instance" # The path after /mnt/lustre/ should match the path to the dataset on the Lustre instance root
+export BASE_OUTPUT_DIR="gs://your-bucket/ds3-run"
+export WORKLOAD_IMAGE="your-registry/your-maxtext-latest:runner"
 ```
 
 To configure and run the benchmark:
@@ -455,10 +465,75 @@ xpk cluster delete --cluster ${CLUSTER_NAME} --zone ${ZONE} --project ${PROJECT_
 After the job completes, you can check the results by:
 
 -   Accessing output logs from your job.
--   Checking the checkpoints and TensorBoard output under the `${BASE_OUTPUT_DIR}`
-    variable in your `run_recipe.sh` (`/mnt/lustre/checkpoints` on Lustre for
-    this recipe).
+-   Checking the TensorBoard output under `${BASE_OUTPUT_DIR}` as set in
+    `run_recipe.sh` (checkpointing is disabled in this recipe).
 -   Reviewing metrics in Cloud Monitoring, if configured.
+
+## Troubleshooting
+
+**`file:///deps does not appear to be a Python project`**
+
+The runner image's `/deps` contains only `benchmarks/`, `src/`, `tests/` and
+`pytest.ini` — no `pyproject.toml` or `setup.py`. Do not run
+`pip install -e .`; just `cd /deps` and invoke the entrypoint module.
+
+**Config not found**
+
+The correct config path is `src/maxtext/configs/base.yml`. There is no
+`/deps/maxtext` directory.
+
+**Errors about assets paths**
+
+The runner image already sets `MAXTEXT_ASSETS_ROOT=/deps/src/maxtext/assets`
+(**lowercase** `maxtext`) and `MAXTEXT_PKG_DIR`. Do not override them. The
+`/deps/src/MaxText/assets` path used by older recipes does not exist.
+
+**Node pool created but shows 0 nodes**
+
+Check that the placement policy exists and its topology matches. TPU v7 cannot
+auto-create one.
+
+## Appendix: switching to Lustre
+
+To train on a real dataset with checkpointing, mount Google Cloud Managed
+Lustre. The instance must be on the **same VPC network** as the GKE cluster.
+
+### 1. Create the Lustre instance
+
+1. Create new Lustre instance following [instructions](https://docs.cloud.google.com/managed-lustre/docs/create-instance) to hold the dataset and checkpoints. Mount the Lustre instance on
+[Compute Engine](https://docs.cloud.google.com/managed-lustre/docs/connect-from-compute-engine)
+or
+[Kubernetes Engine](https://docs.cloud.google.com/managed-lustre/docs/lustre-csi-driver-new-volume). It is important to use the same network as the GKE cluster when creating the Lustre instance. Since the same instance will be used for both dataloading and checkpointing, at least 36 TB of storage is recommended.
+
+2. Prepare your dataset in the Lustre instance. This recipe is configured to use the Grain loader with ArrayRecord files. Ensure your dataset files are accessible in this instance. You would first need to download the AllenAI C4 dataset dataset from its source. Follow these [instructions](https://docs.cloud.google.com/managed-lustre/docs/transfer-data) to transfer the dataset to the Lustre instance.
+
+### 2. Mount the Lustre instance
+
+Managed Lustre lets you mount and access it as local file systems, so applications can read and write objects using standard file system semantics. You'll need to use the below commands to create [XPK storage resources](https://github.com/AI-Hypercomputer/xpk/blob/main/docs/usage/storage.md#managed-lustre) for the instance in order to mount it to the MaxText workload. For the lustre instance, use the PV/PVC definition in [../k8s/lustre_pvc.yaml](../k8s/lustre_pvc.yaml).
+Be sure to update `volumeHandle` in the yamls with your correct lustre instance names. Creating a lustre instance and attaching xpk storage is a one time setup.
+```
+# Set variables
+export PROJECT=""
+export CLUSTER=""
+export ZONE=""
+
+# Lustre PV/PVC
+xpk storage attach lustre-volume --type=lustre --project=$PROJECT --cluster=$CLUSTER --zone=$ZONE --mount-point=/mnt/lustre --readonly=false --auto-mount=false --manifest=../k8s/lustre_pvc.yaml
+```
+
+### 3. Update run_recipe.sh
+
+Replace
+
+```
+tokenizer_path=src/maxtext/assets/tokenizer.mistral-v3 dataset_type=synthetic enable_checkpointing=False
+```
+
+with the grain / checkpoint arguments, add `--storage=$LUSTRE_VOLUME_NAME` to
+`xpk workload create`, and point `BASE_OUTPUT_DIR` at `/mnt/lustre/checkpoints`.
+See the upstream 256-chip `4k-bf16-tpu7x-4x8x8-lustre` recipe for the full set.
+
+**This path has not been validated on hardware.**
 
 ## Next steps: deeper exploration and customization
 

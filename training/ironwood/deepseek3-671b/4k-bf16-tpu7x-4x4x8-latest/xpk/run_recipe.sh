@@ -27,11 +27,9 @@ fi
 export PROJECT_ID=""
 export CLUSTER_NAME=""
 export ZONE=""
-export BASE_OUTPUT_DIR="/mnt/lustre/checkpoints"
+export BASE_OUTPUT_DIR=""
 export WORKLOAD_IMAGE=""
-export WORKLOAD_NAME="$(printf "%.26s" "${USER//_/-}-deepseekv3-671b-4096-fsdp-lustre-128")-$(date +%Y%m%d-%H%M)"
-export LUSTRE_VOLUME_NAME="lustre-volume"
-export DATASET_BUCKET_MOUNTED_PATH="/mnt/lustre/datasets"
+export WORKLOAD_NAME="$(printf "%.26s" "${USER//_/-}-deepseekv3-671b-4096-fsdp")-$(date +%Y%m%d-%H%M)"
 
 # XLA Flags
 XLA_FLAGS=" \
@@ -103,19 +101,10 @@ cost_estimate_flops_fwd=5000000000000 \
 cost_estimate_flops_bwd=5000000000000 \
 float32_weight_sum=False \
 use_tokamax_gmm=True \
-tokenizer_path='deepseek-ai/DeepSeek-V3-Base' \
-tokenizer_type=huggingface \
-enable_checkpointing=True \
-checkpoint_storage_concurrent_gb=400 \
-async_checkpointing=true \
-enable_single_replica_ckpt_restoring=true \
-checkpoint_storage_target_data_file_size_bytes=209715200 \
-dataset_type='grain' \
-grain_file_type=arrayrecord \
-grain_train_files=${DATASET_BUCKET_MOUNTED_PATH}/multilingual-c4/array-record/c4/multilingual/3.0.1/*.arrayrecord \
-grain_worker_count=2 \
+tokenizer_path=src/maxtext/assets/tokenizer.mistral-v3 \
+dataset_type=synthetic \
+enable_checkpointing=False \
 steps=30 \
-checkpoint_period=25 \
 base_output_directory=${BASE_OUTPUT_DIR} \
 run_name=${WORKLOAD_NAME}"
 
@@ -130,12 +119,10 @@ xpk workload create \
   --base-docker-image="${WORKLOAD_IMAGE}" \
   --enable-debug-logs \
   --workload=$WORKLOAD_NAME \
-  --storage=$LUSTRE_VOLUME_NAME \
   --command="set -e && \
     export LIBTPU_INIT_ARGS='${XLA_FLAGS}' && \
     export ENABLE_PATHWAYS_PERSISTENCE=1 && \
     export JAX_PLATFORMS=tpu,cpu && \
     export ENABLE_PJRT_COMPATIBILITY=true && \
-    export MAXTEXT_ASSETS_ROOT=/deps/src/MaxText/assets MAXTEXT_PKG_DIR=/deps/src/maxtext && \
-    cd /deps && pip install --no-deps -e . && \
-    python3 -m src.maxtext.trainers.pre_train.train maxtext/configs/base.yml ${MAXTEXT_ARGS}"
+    cd /deps && \
+    python3 -m src.maxtext.trainers.pre_train.train src/maxtext/configs/base.yml ${MAXTEXT_ARGS}"
