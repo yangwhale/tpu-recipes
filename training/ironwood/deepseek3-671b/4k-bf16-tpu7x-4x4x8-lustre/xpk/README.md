@@ -9,6 +9,8 @@ If you prefer plain Kubernetes objects over the XPK wrapper — for example when
 handing the recipe to a customer who needs to read exactly what gets deployed —
 see the equivalent manifest-based recipe in [../k8s](../k8s/README.md).
 
+> 中文版：[README.zh-CN.md](README.zh-CN.md)
+
 ## Workload Details
 
 This workload is configured with the following details:
@@ -453,8 +455,9 @@ xpk cluster delete --cluster ${CLUSTER_NAME} --zone ${ZONE} --project ${PROJECT_
 After the job completes, you can check the results by:
 
 -   Accessing output logs from your job.
--   Checking any data stored in the Google Cloud Storage bucket specified by the
-    `${BASE_OUTPUT_DIR}` variable in your `run_recipe.sh`.
+-   Checking the checkpoints and TensorBoard output under the `${BASE_OUTPUT_DIR}`
+    variable in your `run_recipe.sh` (`/mnt/lustre/checkpoints` on Lustre for
+    this recipe).
 -   Reviewing metrics in Cloud Monitoring, if configured.
 
 ## Next steps: deeper exploration and customization

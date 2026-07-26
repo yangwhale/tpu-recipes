@@ -10,6 +10,8 @@ checkpoints.
 Everything is expressed as plain Kubernetes objects — no XPK required. The
 equivalent XPK-based recipe lives in [../xpk](../xpk/README.md).
 
+> 中文版：[README.zh-CN.md](README.zh-CN.md)
+
 ## Workload Details
 
 This workload is configured with the following details:
@@ -205,8 +207,8 @@ kubectl delete jobset ${WORKLOAD_NAME} -n default
 After the job completes, you can check the results by:
 
 -   Accessing output logs from your job using `kubectl logs`.
--   Checking any data stored in the Google Cloud Storage bucket specified by the
-    `${BASE_OUTPUT_DIR}` variable in your `run_recipe.sh`.
+-   Inspecting the checkpoints and TensorBoard output under `${BASE_OUTPUT_DIR}`
+    (`/mnt/lustre/checkpoints` on the Lustre instance).
 -   Reviewing metrics in Cloud Monitoring, if configured.
 
 ## Next steps: deeper exploration and customization
