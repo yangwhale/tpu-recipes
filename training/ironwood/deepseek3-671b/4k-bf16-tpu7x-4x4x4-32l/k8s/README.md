@@ -214,7 +214,12 @@ main_model_loss: 12.271, mtp_loss: 1.227
 MFU = (TFLOP/s/device × 2) / 2307
 ```
 
-2307 是 TPU v7 每 chip 的 BF16 峰值 TFLOPS。
+2307 是 TPU v7 每 chip 的 BF16 峰值 TFLOPS。式中的 `× 2` 是因为 v7 的
+1 chip = 2 JAX device。
+
+**这个 `× 2` 只对 v7 成立。** v5p / v4 是 MegaCore，1 chip = 1 device，换算方式
+不同。跨代际对照请先读
+[TPU 单位对照](../../../TPU-UNITS.md)。
 
 ## 验证状态
 

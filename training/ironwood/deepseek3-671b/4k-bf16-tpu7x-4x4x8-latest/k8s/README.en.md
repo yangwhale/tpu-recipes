@@ -249,6 +249,9 @@ profiled steps and the one after them are also slower.
 | TFLOP/s/chip | Per chip, i.e. the logged value × 2 |
 | MFU | Per-chip value ÷ 2,307 (v7 BF16 per-chip peak) |
 
+The chip / device / TensorCore relationship differs across generations — see
+[TPU units](../../../TPU-UNITS.en.md).
+
 ## Clean up
 
 ```bash

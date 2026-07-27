@@ -221,7 +221,12 @@ comes from other terms), confirming `mtp_loss_scaling_factor=0.1` is in effect.
 MFU = (TFLOP/s/device × 2) / 2307
 ```
 
-2307 is the TPU v7 per-chip BF16 peak in TFLOPS.
+2307 is the TPU v7 per-chip BF16 peak in TFLOPS. The `× 2` is because a v7 chip
+exposes 2 JAX devices.
+
+**That `× 2` applies to v7 only.** v5p / v4 use MegaCore with 1 chip = 1 device
+and convert differently. For cross-generation work, read
+[TPU units](../../../TPU-UNITS.en.md) first.
 
 ## Validation status
 
