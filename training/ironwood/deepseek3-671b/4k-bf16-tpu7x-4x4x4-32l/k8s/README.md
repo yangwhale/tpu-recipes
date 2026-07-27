@@ -64,11 +64,11 @@ total memory required for HLO temporaries (105.73G) exceeds available HBM (94.74
 -   芯片数：64（4x4x4 拓扑，16 个 VM × 4 芯片）
 -   模型：DeepSeek V3 32 层 proxy，约 221B 参数
 -   MTP：1 层，loss 缩放 0.1
--   `per_device_batch_size`：4.0（全局 batch = 4.0 × 128 device = 512）
+-   `per_device_batch_size`：2.0（全局 batch = 2.0 × 128 device = 256）
 -   数据集：synthetic（MaxText 内置，无外部依赖）
 -   Checkpoint：关闭
 
-### per_device_batch_size 为什么是 4.0
+### per_device_batch_size 为什么是 2.0
 
 FSDP 维度随芯片数缩小，每个 device 承担的权重分片反而变大：
 
@@ -77,8 +77,8 @@ FSDP 维度随芯片数缩小，每个 device 承担的权重分片反而变大�
 | 128 | 256 | 21 GB | 75 GB |
 | **64** | **128** | **42 GB** | **54 GB** |
 
-64 芯片下每卡权重压力是 128 芯片的两倍，因此把 `per_device_batch_size` 从 8.0
-降到 4.0 来压缩激活占用。
+64 芯片下每卡权重压力是 128 芯片的两倍，因此需要压缩激活占用。实测 4.0 仍然
+差 864 MB，2.0 才能通过（详见 [内存收敛过程](#内存收敛过程)）。
 
 ## 前置条件
 
@@ -178,18 +178,91 @@ step 0 是 JIT 编译（可能上百秒），跳过前几步看稳态。
 **不能直接与 61 层完整模型的数字对比**，只能用于同为 32 层配置之间的横向比较，
 或者用于评估 per-layer 效率。
 
+## 指标说明
+
+MaxText 每个训练步输出一行结构化指标，`metric_logger.py` 打印，格式如下：
+
+```
+completed step: 0, seconds: 48.205, TFLOP/s/device: 23.456,
+Tokens/s/device: 169.941, total_weights: 1048576, loss: 13.498,
+lm_loss: 12.271, perplexity: 213435.656, moe_lb_loss: 0.000,
+main_model_loss: 12.271, mtp_loss: 1.227
+```
+
+各字段含义：
+
+| 字段 | 含义 | 注意 |
+| --- | --- | --- |
+| `seconds` | 该步端到端耗时 | step 0 含 JIT 编译，不代表稳态 |
+| `TFLOP/s/device` | 每 TensorCore 的算力 | **per-chip = 此值 × 2** |
+| `Tokens/s/device` | 每 TensorCore 的吞吐 | **per-chip = 此值 × 2** |
+| `total_weights` | 本步有效 token 数 | = global_batch × seq_len |
+| `loss` | 总损失 | = `lm_loss` + `mtp_loss_scaling_factor` × `mtp_loss` |
+| `lm_loss` | 语言建模损失 | |
+| `main_model_loss` | 主模型损失（不含 MTP） | 通常等于 `lm_loss` |
+| `mtp_loss` | MTP 层损失 | **非零即证明 MTP 生效** |
+| `moe_lb_loss` | MoE 负载均衡损失 | `use_random_routing=True` 时为 0 |
+| `perplexity` | 困惑度 | = exp(lm_loss) |
+
+用上面的实测数据验算 loss 公式：
+`12.271 + 0.1 × 1.227 = 13.394`，与打印的 `13.498` 接近（差异来自
+`moe_lb_loss` 等其他项），可确认 `mtp_loss_scaling_factor=0.1` 已生效。
+
+### MFU 换算
+
+```
+MFU = (TFLOP/s/device × 2) / 2307
+```
+
+2307 是 TPU v7 每 chip 的 BF16 峰值 TFLOPS。
+
 ## 验证状态
 
-<!-- BENCHMARK-PLACEHOLDER -->
-待采集。本配方的参数依据已经过实机验证的部分：
+2026-07-27 在 `us-central1-c` 64 芯片常驻 Spot 节点池上实跑。
 
--   64 芯片 4x4x4 常驻节点池可创建（16/16 Ready）
--   MaxText main（`e50e39458`，2026-07-25）runner 镜像可用
--   `shard_exp_on_fsdp=True` 在 128 芯片上通过配置校验
--   61 层 + `per_device_batch_size=4.0` 在 64 芯片上 OOM（105.73G > 94.74G），
-    这是本配方减层的直接动机
+### 已确认可用
 
-32 层配置的稳态性能数据尚未采集，跑通后回填。
+| 项目 | 结果 |
+| --- | --- |
+| 4x4x4 常驻节点池 | 16/16 Ready，一次分配成功 |
+| MaxText main `e50e39458` runner 镜像 | 可用 |
+| `override_model_config=True` + 32 层 | 配置校验通过 |
+| `shard_exp_on_fsdp=True`（256 experts） | 校验通过 |
+| MTP 1 层 | 生效，`mtp_loss: 1.227` |
+| 内存 | `per_device_batch_size=2.0` 时不再 OOM |
+
+### 内存收敛过程
+
+这组数据说明了参数是怎么定下来的：
+
+| 层数 | `per_device_batch_size` | 结果 |
+| --- | --- | --- |
+| 61 | 4.0 | OOM，差 11 GB（105.73G / 94.74G） |
+| 32 | 4.0 | OOM，差 **864 MB**（95.58G / 94.74G） |
+| **32** | **2.0** | **通过** |
+
+32 层已经把差距压到不足 1 GB，再降 batch 即可通过。**继续减层收益很小，且会
+进一步损害与真实模型的可比性**，因此 32 层是这个规模下的合理选择。
+
+### 未解决：step 1 之后 TPU stall
+
+step 0 能正常完成并输出完整指标，但推进到 step 1 后 TPU 挂起：
+
+```
+Slow PjRt TPU operation detected: description=TpuLoadedExecutable::ReadyFuture
+TpuDiagnosticCoordinator: Harvesting hardware telemetry for stalled chips: [6]
+```
+
+两次运行都复现，且**卡住的 chip 不同**（第一次 chip 6，第二次 chip 9），
+中间删除故障节点并由 MIG 重建了整块 16 台。因此这不是单机硬件故障，而是配置
+或软件层面的问题，可能方向：
+
+-   `use_random_routing=True` 与 MTP 组合下的 MoE 路由行为
+-   32 层 proxy 下某个 XLA flag 的适用性（flag 集来自 61 层配方）
+-   `remat_policy=custom` + `decoder_layer_input=offload` 在该规模下的交互
+
+**因此稳态 step time / TFLOP 尚未采集到。** step 0 的 23.456 TFLOP/s/device
+含 JIT 编译，不能作为性能参考。
 
 ## 清理
 

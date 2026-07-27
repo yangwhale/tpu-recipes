@@ -67,10 +67,11 @@ XLA_FLAGS=" \
 # MaxText Workload Overrides
 MAXTEXT_ARGS="\
 model_name=deepseek3-671b \
+override_model_config=True \
 base_num_decoder_layers=32 \
 mtp_num_layers=1 \
 mtp_loss_scaling_factor=0.1 \
-per_device_batch_size=4.0 \
+per_device_batch_size=2.0 \
 max_target_length=4096 \
 dcn_pipeline_parallelism=1 \
 dcn_data_parallelism=-1 \

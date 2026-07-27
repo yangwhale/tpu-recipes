@@ -67,11 +67,11 @@ config uses expert parallelism (EP16), so the constraints differ.
 -   Chips: 64 (4x4x4 topology, 16 VMs × 4 chips)
 -   Model: DeepSeek V3 32-layer proxy, ~221B parameters
 -   MTP: 1 layer, loss scaling 0.1
--   `per_device_batch_size`: 4.0 (global batch = 4.0 × 128 devices = 512)
+-   `per_device_batch_size`: 2.0 (global batch = 2.0 × 128 devices = 256)
 -   Dataset: synthetic (built into MaxText)
 -   Checkpointing: disabled
 
-### Why per_device_batch_size is 4.0
+### Why per_device_batch_size is 2.0
 
 As the FSDP axis shrinks with chip count, each device carries a *larger* weight
 shard:
@@ -82,7 +82,8 @@ shard:
 | **64** | **128** | **42 GB** | **54 GB** |
 
 Per-device weight pressure at 64 chips is double that of 128 chips, so
-`per_device_batch_size` drops from 8.0 to 4.0 to shrink activation memory.
+activation memory has to shrink. Measured: 4.0 still falls 864 MB short; 2.0
+passes (see [memory convergence](#memory-convergence)).
 
 ## Prerequisites
 
@@ -186,20 +187,94 @@ and throughput are **not directly comparable to the 61-layer model**. Use them
 for comparisons between 32-layer configurations, or to assess per-layer
 efficiency.
 
+## Metrics reference
+
+MaxText prints one structured line per training step via `metric_logger.py`:
+
+```
+completed step: 0, seconds: 48.205, TFLOP/s/device: 23.456,
+Tokens/s/device: 169.941, total_weights: 1048576, loss: 13.498,
+lm_loss: 12.271, perplexity: 213435.656, moe_lb_loss: 0.000,
+main_model_loss: 12.271, mtp_loss: 1.227
+```
+
+| Field | Meaning | Note |
+| --- | --- | --- |
+| `seconds` | End-to-end time of this step | step 0 includes JIT compilation |
+| `TFLOP/s/device` | Per TensorCore | **per-chip = value × 2** |
+| `Tokens/s/device` | Per TensorCore | **per-chip = value × 2** |
+| `total_weights` | Effective tokens this step | = global_batch × seq_len |
+| `loss` | Total loss | = `lm_loss` + `mtp_loss_scaling_factor` × `mtp_loss` |
+| `lm_loss` | Language modelling loss | |
+| `main_model_loss` | Main model loss (excludes MTP) | usually equals `lm_loss` |
+| `mtp_loss` | MTP layer loss | **non-zero proves MTP is active** |
+| `moe_lb_loss` | MoE load-balancing loss | 0 when `use_random_routing=True` |
+| `perplexity` | Perplexity | = exp(lm_loss) |
+
+Sanity-check the loss formula against the measured data:
+`12.271 + 0.1 × 1.227 = 13.394`, close to the printed `13.498` (the remainder
+comes from other terms), confirming `mtp_loss_scaling_factor=0.1` is in effect.
+
+### MFU
+
+```
+MFU = (TFLOP/s/device × 2) / 2307
+```
+
+2307 is the TPU v7 per-chip BF16 peak in TFLOPS.
+
 ## Validation status
 
-<!-- BENCHMARK-PLACEHOLDER -->
-Pending. Parts of the reasoning behind these parameters have been verified on
-hardware:
+Run on a 64-chip fixed Spot node pool in `us-central1-c` on 2026-07-27.
 
--   A 64-chip 4x4x4 fixed node pool can be created (16/16 Ready)
--   The MaxText main (`e50e39458`, 2026-07-25) runner image works
--   `shard_exp_on_fsdp=True` passes config validation at 128 chips
--   61 layers with `per_device_batch_size=4.0` OOMs at 64 chips
-    (105.73G > 94.74G) — the direct motivation for this reduced-layer recipe
+### Confirmed working
 
-Steady-state performance for the 32-layer configuration has not been captured
-yet; it will be filled in once measured.
+| Item | Result |
+| --- | --- |
+| 4x4x4 fixed node pool | 16/16 Ready, allocated on first attempt |
+| MaxText main `e50e39458` runner image | works |
+| `override_model_config=True` + 32 layers | config validation passes |
+| `shard_exp_on_fsdp=True` (256 experts) | passes |
+| MTP, 1 layer | active, `mtp_loss: 1.227` |
+| Memory | no OOM at `per_device_batch_size=2.0` |
+
+### Memory convergence
+
+This is how the parameters were arrived at:
+
+| Layers | `per_device_batch_size` | Result |
+| --- | --- | --- |
+| 61 | 4.0 | OOM, 11 GB short (105.73G / 94.74G) |
+| 32 | 4.0 | OOM, **864 MB** short (95.58G / 94.74G) |
+| **32** | **2.0** | **passes** |
+
+At 32 layers the gap is under 1 GB and halving the batch closes it. **Reducing
+layers further yields little and degrades comparability with the real model**,
+so 32 layers is the reasonable choice at this scale.
+
+### Unresolved: TPU stall after step 1
+
+Step 0 completes and emits full metrics, but the run hangs when advancing to
+step 1:
+
+```
+Slow PjRt TPU operation detected: description=TpuLoadedExecutable::ReadyFuture
+TpuDiagnosticCoordinator: Harvesting hardware telemetry for stalled chips: [6]
+```
+
+Reproduced on two runs, with a **different chip stalling each time** (chip 6,
+then chip 9), after deleting the faulty node and having the MIG rebuild all 16
+VMs. So this is not a single-machine hardware fault but a configuration or
+software issue. Candidate directions:
+
+-   Interaction of `use_random_routing=True` with MTP in MoE routing
+-   Applicability of some XLA flag at 32 layers (the flag set comes from the
+    61-layer recipe)
+-   `remat_policy=custom` + `decoder_layer_input=offload` at this scale
+
+**Steady-state step time / TFLOP has therefore not been captured.** The step 0
+figure of 23.456 TFLOP/s/device includes JIT compilation and is not a
+performance reference.
 
 ## Clean up
 
