@@ -77,7 +77,12 @@ GBS = per_device_batch_size × number of JAX devices
 | --- | --- | --- | --- | --- |
 | v7x 4x4x8 | 128 | 256 | 8.0 | 2048 |
 | v7x 4x4x4 | 64 | 128 | 8.0 | 1024 |
-| v5p 4x8x8 | 256 | 256 | 8.0 | 2048 |
+| v5p 4x8x8 | 256 | 256 | 4 | 1024 |
+
+The pdb of 4 on the v5p row is not a typo. The device count is the same 256,
+but a v5p device has 95 GB while a v7x *chip* has 192 GB — the same device
+count does not hold the same batch. On DeepSeek V3 671B, pdb=5 already fails;
+see [the v5p notes](v5p/README.en.md#3-half-the-hbm-so-batch-size-must-be-recomputed).
 
 ### FSDP shard pressure
 

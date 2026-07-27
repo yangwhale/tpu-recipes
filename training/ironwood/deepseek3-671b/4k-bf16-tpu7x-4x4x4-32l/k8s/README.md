@@ -84,7 +84,7 @@ FSDP 维度随芯片数缩小，每个 device 承担的权重分片反而变大�
 
 -   **GKE 集群**：已安装并运行 [JobSet](https://jobset.sigs.k8s.io/docs/installation/)。
 -   **容器镜像**：MaxText runner 镜像，构建方式见
-    [../../4k-bf16-tpu7x-4x4x8-latest/k8s/README.md#容器镜像](../4k-bf16-tpu7x-4x4x8-latest/k8s/README.md#容器镜像)。
+    [4x4x8-latest 配方的容器镜像章节](../../4k-bf16-tpu7x-4x4x8-latest/k8s/README.md#容器镜像)。
     注意必须是 **runner** 镜像，base 镜像不含 MaxText 源码。
 -   **工具**：`gcloud`、`kubectl`、`gke-gcloud-auth-plugin`、`envsubst`。
 -   **Placement policy**：TPU v7 不支持自动创建，必须先建 4x4x4 的 policy。
@@ -219,7 +219,7 @@ MFU = (TFLOP/s/device × 2) / 2307
 
 **这个 `× 2` 只对 v7 成立。** v5p / v4 是 MegaCore，1 chip = 1 device，换算方式
 不同。跨代际对照请先读
-[TPU 单位对照](../../../TPU-UNITS.md)。
+[TPU 单位对照](../../../../TPU-UNITS.md)。
 
 ## 验证状态
 
@@ -299,4 +299,4 @@ placement policy 是可复用的免费资源，建议保留。
 **其他启动类错误**
 
 `pip install -e .` 失败、config 找不到、assets 路径报错等，见
-[4x4x8-latest 配方的常见问题](../4k-bf16-tpu7x-4x4x8-latest/k8s/README.md#常见问题)。
+[4x4x8-latest 配方的常见问题](../../4k-bf16-tpu7x-4x4x8-latest/k8s/README.md#常见问题)。

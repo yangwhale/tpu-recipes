@@ -1,6 +1,8 @@
 # DeepSeek V3 671B pretraining on 256 v5p chips (K8s manifest)
 
 > 中文版：[README.md](README.md)
+>
+> Back to the [v5p recipe index](../README.en.md)
 
 This recipe runs DeepSeek V3 671B pretraining on **256 v5p chips**
 (topology `4x8x8`) with a synthetic dataset and checkpointing disabled, to
@@ -15,7 +17,7 @@ The upstream recipe
    exactly what gets deployed
 
 For the chip / device / TensorCore unit relationships see
-[TPU-UNITS.en.md](../../ironwood/TPU-UNITS.en.md). Short version: v5p uses
+[TPU-UNITS.en.md](../../TPU-UNITS.en.md). Short version: v5p uses
 MegaCore, so **1 chip = 1 JAX device**, and the 1024 in `v5p-1024` counts
 TensorCores, which is 512 chips.
 

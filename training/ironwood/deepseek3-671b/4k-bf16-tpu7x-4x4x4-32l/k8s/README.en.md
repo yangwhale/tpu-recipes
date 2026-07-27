@@ -89,7 +89,7 @@ passes (see [memory convergence](#memory-convergence)).
 
 -   **GKE cluster** with [JobSet](https://jobset.sigs.k8s.io/docs/installation/).
 -   **Container image**: a MaxText runner image — see
-    [container image](../4k-bf16-tpu7x-4x4x8-latest/k8s/README.en.md#container-image).
+    [container image](../../4k-bf16-tpu7x-4x4x8-latest/k8s/README.en.md#container-image).
     It must be the **runner** image; the base image has no MaxText source.
 -   **Tools**: `gcloud`, `kubectl`, `gke-gcloud-auth-plugin`, `envsubst`.
 -   **Placement policy**: TPU v7 cannot auto-create one; create the 4x4x4 policy
@@ -226,7 +226,7 @@ exposes 2 JAX devices.
 
 **That `× 2` applies to v7 only.** v5p / v4 use MegaCore with 1 chip = 1 device
 and convert differently. For cross-generation work, read
-[TPU units](../../../TPU-UNITS.en.md) first.
+[TPU units](../../../../TPU-UNITS.en.md) first.
 
 ## Validation status
 
@@ -313,4 +313,4 @@ auto-create one.
 **Other startup errors**
 
 `pip install -e .` failures, config not found, assets path errors — see
-[troubleshooting in the 4x4x8-latest recipe](../4k-bf16-tpu7x-4x4x8-latest/k8s/README.en.md#troubleshooting).
+[troubleshooting in the 4x4x8-latest recipe](../../4k-bf16-tpu7x-4x4x8-latest/k8s/README.en.md#troubleshooting).

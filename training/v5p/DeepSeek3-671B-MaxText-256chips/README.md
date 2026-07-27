@@ -1,6 +1,8 @@
 # DeepSeek V3 671B 在 v5p 256 chips 上的预训练（K8s manifest）
 
 > English version: [README.en.md](README.en.md)
+>
+> 返回 [v5p 配方总览](../README.md)
 
 本配方在 **256 个 v5p chips**（拓扑 `4x8x8`）上跑 DeepSeek V3 671B 预训练，
 数据集用 synthetic，不写 checkpoint，目的是验证流程与采集性能基线。
@@ -12,7 +14,7 @@
 2. **纯 K8s manifest**：直接 `kubectl apply`，交付给客户时能一眼看清部署了什么
 
 单位换算（chip / device / TensorCore 三套单位的关系）见
-[TPU-UNITS.md](../../ironwood/TPU-UNITS.md)。简记：v5p 是 MegaCore，
+[TPU-UNITS.md](../../TPU-UNITS.md)。简记：v5p 是 MegaCore，
 **1 chip = 1 JAX device**，机型名 `v5p-1024` 里的 1024 是 TensorCore 数，
 对应 512 chips。
 

@@ -2,6 +2,12 @@
 
 The training recipes contained in this folder are optimized for Ironwood TPU. Here is a summary of the included recipes.
 
+> The `TFLOPs/sec/chip` column below is **per chip**. An Ironwood chip exposes
+> **2 JAX devices**, so this is twice the `TFLOP/s/device` that MaxText prints.
+> Read [TPU-UNITS.en.md](../TPU-UNITS.en.md) before comparing against another
+> generation — on [v5p](../v5p/README.en.md) one chip is one device and no
+> doubling applies.
+
 | <div style="width:100px;">Model ID</div> | Number of chips | GBS | Sequence length | Precision | Step time (seconds) | TFLOPs/sec/chip | Tokens/sec/chip |
 |-----------------|--------------------|--------------|--------------------------|--------------------|-------------|--------------|-----------------------|
 | deepseek-v3     | 128                | 2048         | 4096                     | bf16               | 27.02       | 607.53       | 2,425.75              |

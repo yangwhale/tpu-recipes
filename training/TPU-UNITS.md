@@ -70,7 +70,12 @@ GBS = per_device_batch_size × JAX device 数
 | --- | --- | --- | --- | --- |
 | v7x 4x4x8 | 128 | 256 | 8.0 | 2048 |
 | v7x 4x4x4 | 64 | 128 | 8.0 | 1024 |
-| v5p 4x8x8 | 256 | 256 | 8.0 | 2048 |
+| v5p 4x8x8 | 256 | 256 | 4 | 1024 |
+
+v5p 那行的 pdb 只有 4 不是笔误。device 数虽然同为 256，但 v5p 每 device
+只有 95 GB，而 v7x 每 chip 有 192 GB——同样的 device 数装不下同样的 batch。
+DeepSeek V3 671B 上实测 pdb=5 就会失败，详见
+[v5p 配方说明](v5p/README.md#3-hbm-少一半batch-size-要重算)。
 
 ### FSDP 分片压力
 

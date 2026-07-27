@@ -239,7 +239,7 @@ gcloud logging read 'protoPayload.methodName="compute.instances.preempted"' \
 | MFU | per-chip 值 ÷ 2,307（v7 BF16 每 chip 峰值） |
 
 单位关系（chip / device / TensorCore）跨代际不同，详见
-[TPU 单位对照](../../../TPU-UNITS.md)。
+[TPU 单位对照](../../../../TPU-UNITS.md)。
 
 ## 清理资源
 
