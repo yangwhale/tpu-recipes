@@ -323,3 +323,14 @@ reclaimed, but deleting it means racing for capacity again**):
 ```bash
 gcloud container node-pools delete <NODEPOOL> --cluster <CLUSTER> --region <REGION>
 ```
+
+**A multi-host TPU node pool cannot be scaled down — deletion is the only
+option.** Scaling to zero to save money does not work:
+
+```
+501 Unimplemented: Multi-host TPU pool (<name>) manual resize is not supported.
+```
+
+A TPU slice is allocated atomically, so "resize" is not a meaningful operation
+on it. This differs from CPU/GPU node pool habits — do not waste time trying
+`clusters resize --num-nodes=0`.

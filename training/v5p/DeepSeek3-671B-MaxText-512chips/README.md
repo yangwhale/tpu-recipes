@@ -303,3 +303,12 @@ while [ "$(kubectl get pods -l jobset.sigs.k8s.io/jobset-name=$WORKLOAD_NAME \
 ```bash
 gcloud container node-pools delete <NODEPOOL> --cluster <CLUSTER> --region <REGION>
 ```
+
+**多机 TPU 节点池不能缩容，只能整池删。** 想省钱先缩到 0 是行不通的：
+
+```
+501 Unimplemented: Multi-host TPU pool (<name>) manual resize is not supported.
+```
+
+整片 TPU 是原子分配的，"改大小"这个概念不成立——这跟 CPU/GPU 节点池的运维直觉
+不一样，别浪费时间试 `clusters resize --num-nodes=0`。
