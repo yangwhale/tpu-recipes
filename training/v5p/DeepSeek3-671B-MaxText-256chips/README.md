@@ -22,7 +22,38 @@
 
 - GKE 集群，含一个 256 chips 的 v5p 节点池（64 台 VM × 4 chips，拓扑 `4x8x8`）
 - 已安装 JobSet CRD
-- Docker 已配置 Artifact Registry 推送权限
+- 本地装了 `envsubst`（Debian/Ubuntu 在 `gettext-base` 包里）——运行那步要用
+- Docker 已配置 Artifact Registry 推送权限（**仅自己构建镜像时需要**；
+  直接用现成镜像可跳过）
+
+kubectl 先接上集群：
+
+```bash
+gcloud container clusters get-credentials <CLUSTER> \
+  --region <REGION> --project <PROJECT>
+```
+
+自检（三项都对才往下走）：
+
+```bash
+kubectl get nodes -l cloud.google.com/gke-nodepool=<NODEPOOL> --no-headers | grep -c ' Ready '   # 期望 64
+kubectl get crd jobsets.jobset.x-k8s.io                                                          # 期望存在
+command -v envsubst                                                                              # 期望有路径
+```
+
+### 先确认节点池的两个属性
+
+这两项决定后面怎么配，**建池之后改不了**，值得提前查清：
+
+```bash
+gcloud container node-pools describe <NODEPOOL> --cluster <CLUSTER> \
+  --region <REGION> --format='value(config.spot, config.oauthScopes)'
+```
+
+- **是否 spot**：spot 池会被抢占，且抢占表现为 collective 挂死，
+  见 [spot 节点池抢占](#spot-节点池抢占)
+- **OAuth scope**：只有 `devstorage.read_only` 时 `BASE_OUTPUT_DIR`
+  不能用 GCS，见 [`BASE_OUTPUT_DIR` 必须真实可写](#base_output_dir-必须真实可写)
 
 ### 拓扑形状不要自己凑
 
@@ -49,6 +80,17 @@ bash docker_build_dependency_image.sh DEVICE=tpu MODE=stable JAX_VERSION=0.7.0
 
 **但这条命令现在直接跑会得到一个跑不起来的镜像**，原因见下方
 [依赖版本漂移](#依赖版本漂移必读)。需要额外两步。
+
+完整顺序是三步，**下面两节的叙述顺序与执行顺序相反**，按本清单执行：
+
+| 步骤 | 产出镜像 | 做什么 | 对应小节 |
+| --- | --- | --- | --- |
+| 1 | `maxtext_base_image` | 上面那条 `docker_build_dependency_image.sh` | 本节 |
+| 2 | `maxtext_stable__runner` | 用修好的 runner Dockerfile 把 MaxText 源码打进去 | [必须用 runner 镜像](#必须用-runner-镜像) |
+| 3 | 最终镜像 | `FROM maxtext_stable__runner`，用 uv 把依赖钉回快照 | [依赖版本漂移](#依赖版本漂移必读) |
+
+第 3 步的 `FROM maxtext_stable__runner` 依赖第 2 步的产物，
+**照着下一节先做会因为镜像不存在而失败**。
 
 ### 依赖版本漂移（必读）
 
@@ -138,6 +180,19 @@ kubectl logs $POD | grep 'completed step'
 kubectl logs $POD | grep 'Slow PjRt'      # 出现即表示卡住了
 ```
 
+`items[0]` 取到的是任意一个 pod，这里够用：MaxText 在**所有** host 上都打
+`completed step`，不是只有 process 0。（只在 process 0 上发生的是 TensorBoard
+写入，那是另一回事，见
+[输出目录不可写会伪装成 TPU 挂死](#输出目录不可写会伪装成-tpu-挂死)。）
+
+### 第一个 step 要等多久
+
+**`kubectl apply` 之后大约 6–7 分钟才会看到 `completed step: 0`**，
+这段时间日志在刷 HLO dump，属于正常的 XLA 编译，不是卡住。
+
+不要拿实测表里的 step 0 时间（约 100 s）当作等待时间——那是 MaxText 自己的计时，
+不含镜像拉取、JAX 分布式初始化和编译。判断是否真的卡住看 `Slow PjRt`，不看时间。
+
 ## 实测结果
 
 环境：`cloud-tpu-multipod-dev`，us-central1-a，spot，2026-07-27
@@ -162,12 +217,51 @@ XLA flag**，只把 `per_device_batch_size` 从 6 降到 4——这是 256 chips
 | Tokens/s/device | 477.1 |
 | loss（step 0 → 15） | 12.27 → 9.9 单调下降 |
 
-稳态从 step 3 开始，抖动 ±0.05 s。step 5–12 因 xplane profiler 开启而有额外开销，
-读数时应排除（官方配方同样带 profiler，横向对比时是公平的）。
+稳态从 step 3 开始，抖动 ±0.06 s。
+
+**受 profiler 影响的是 step 5、10、12 三步，不是整个 5–12 区间。**
+实测同一轮里 step 7/8/9 分别是 68.82 / 68.71 / 68.71 s，与 step 3/4/13
+（68.71 / 68.73 / 68.73 s）没有区别，是干净的稳态点。
+
+读数时按这张表取舍：
+
+| step | 状态 | 用不用 |
+| --- | --- | --- |
+| 0 | 含首次编译 | ✗ |
+| 1、6、11 | JAX 异步派发假象（0.005–0.3 s，TFLOP 数虚高） | ✗ |
+| 2 | 尚未收敛（91.8 s） | ✗ |
+| **3、4、7、8、9、13+** | **稳态** | **✓** |
+| 5、10、12 | xplane profiler 写盘开销（104–137 s） | ✗ |
+
+官方配方同样带 profiler，横向对比时是公平的。
 
 `step 1` 那行会显示 29492 TFLOP/s/device 之类的离谱数字，
 这是 **JAX 异步派发**造成的假象——日志在计算真正完成前就打印了，不是真实性能。
 step 6、11 出现 0.006 s 也是同一原因，它与前一步是配对的。
+
+### 独立复现（2026-07-27，另一位操作者、同一节点池）
+
+换一个人、换一个作业名，用同一镜像照本文档从头跑一遍，结果：
+
+| 指标 | 原始记录 | 独立复现 | 差异 |
+| --- | --- | --- | --- |
+| 稳态 step 时间 | 68.70 s | 68.71 s（step 9）/ 68.82 s（step 7） | +0.02% |
+| TFLOP/s/device | 134.1 | 134.08 | −0.01% |
+| Tokens/s/device | 477.1 | 476.9 | −0.04% |
+| loss step 0 | 12.27 | 12.270 | 一致 |
+| loss 末值 | 9.9（step 15） | 9.890（step 12） | 一致 |
+| step 0 | 93.0 s | 104.1 s | **+11.9%** |
+
+**稳态数字可复现到小数点后一位**，说明配方本身是确定的。
+
+唯一有偏差的是 **step 0（93.0 → 104.1 s）**。这一步含首次 XLA 编译，
+受编译缓存和节点状态影响，波动正常，**不要把它当性能指标看**。
+
+复现中也逐条验证了文档里几个"看起来不对但其实正常"的现象，全部对上：
+
+- step 1 报 **30767 TFLOP/s/device**（原始记录 29492）—— JAX 异步派发假象
+- step 6、11 为 **0.005 s** —— 同一假象，与前一步配对
+- step 10、12 为 **137.5 s / 104.3 s** —— xplane profiler 开销，符合"5–12 应排除"
 
 ### `per_device_batch_size` 的上限是 4
 
@@ -313,9 +407,13 @@ gcloud compute operations list --project=<PROJECT> --zones=<ZONE> \
 kubectl delete jobset $WORKLOAD_NAME
 ```
 
-删除是异步的。若要立刻提交下一个作业，**必须等 pod 全部消失**，
+删除是异步的。若要立刻提交下一个作业，**必须等本作业的 pod 全部消失**，
 否则新 pod 会与仍持有 TPU 的旧 pod 抢同一批节点：
 
 ```bash
-while [ "$(kubectl get pods --no-headers | wc -l)" -ne 0 ]; do sleep 10; done
+while [ "$(kubectl get pods -l jobset.sigs.k8s.io/jobset-name=$WORKLOAD_NAME --no-headers 2>/dev/null | wc -l)" -ne 0 ]; do sleep 10; done
 ```
+
+**这里的 `-l jobset.sigs.k8s.io/jobset-name=...` 不能省。** 不带 label 直接数
+`kubectl get pods` 的总行数，会把 namespace 里任何无关 pod 也算进去——
+共享集群上这几乎必然发生，循环永远不会退出。

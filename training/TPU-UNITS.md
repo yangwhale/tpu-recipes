@@ -53,10 +53,10 @@ v7 的 GKE machine type 不走这套命名，直接用 `tpu7x-standard-4t`（4 c
 
 ```
 v5p:  MFU = TFLOP/s/device        / 459     # 1 device = 1 chip
-v7x:  MFU = TFLOP/s/device × 2    / 2307    # 1 chip = 2 devices
+v7x:  MFU = TFLOP/s/device × 2    / 2306    # 1 chip = 2 devices
 ```
 
-459 和 2307 分别是 v5p、v7 的 **per-chip** BF16 峰值 TFLOPS。
+459 和 2306 分别是 v5p、v7 的 **per-chip** BF16 峰值 TFLOPS。
 
 **v7 上那个 `× 2` 在 v5p 上不能做**，这是最容易搬错的一步。
 

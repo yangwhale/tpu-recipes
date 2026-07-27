@@ -25,7 +25,40 @@ TensorCores, which is 512 chips.
 
 - A GKE cluster with a 256-chip v5p node pool (64 VMs × 4 chips, topology `4x8x8`)
 - JobSet CRD installed
-- Docker configured to push to Artifact Registry
+- `envsubst` available locally (Debian/Ubuntu: the `gettext-base` package) —
+  the run step needs it
+- Docker configured to push to Artifact Registry (**only if you build the image
+  yourself**; skip it when using a prebuilt one)
+
+Point kubectl at the cluster first:
+
+```bash
+gcloud container clusters get-credentials <CLUSTER> \
+  --region <REGION> --project <PROJECT>
+```
+
+Self-check — all three must pass before continuing:
+
+```bash
+kubectl get nodes -l cloud.google.com/gke-nodepool=<NODEPOOL> --no-headers | grep -c ' Ready '   # expect 64
+kubectl get crd jobsets.jobset.x-k8s.io                                                          # must exist
+command -v envsubst                                                                              # must print a path
+```
+
+### Check two node pool properties up front
+
+Both drive later decisions and **cannot be changed after the pool is created**:
+
+```bash
+gcloud container node-pools describe <NODEPOOL> --cluster <CLUSTER> \
+  --region <REGION> --format='value(config.spot, config.oauthScopes)'
+```
+
+- **Spot or not**: a spot pool gets preempted, and preemption presents as a
+  collective hang — see [Spot node pool preemption](#spot-node-pool-preemption)
+- **OAuth scopes**: with only `devstorage.read_only`, `BASE_OUTPUT_DIR` cannot
+  be a GCS path — see
+  [`BASE_OUTPUT_DIR` must be genuinely writable](#base_output_dir-must-be-genuinely-writable)
 
 ### Do not improvise the topology shape
 
@@ -53,6 +86,18 @@ bash docker_build_dependency_image.sh DEVICE=tpu MODE=stable JAX_VERSION=0.7.0
 
 **Running that command today produces an image that cannot start.** See
 [dependency drift](#dependency-drift-read-this) below. Two extra steps are needed.
+
+There are three steps in total, and **the two sections below are written in the
+reverse of the execution order**. Follow this list instead:
+
+| Step | Image produced | What it does | Section |
+| --- | --- | --- | --- |
+| 1 | `maxtext_base_image` | the `docker_build_dependency_image.sh` command above | this section |
+| 2 | `maxtext_stable__runner` | bake the MaxText source in using the fixed runner Dockerfile | [You need the runner image](#you-need-the-runner-image-not-the-base-image) |
+| 3 | final image | `FROM maxtext_stable__runner`, pin dependencies back with uv | [Dependency drift](#dependency-drift-read-this) |
+
+Step 3's `FROM maxtext_stable__runner` consumes the output of step 2, so
+**following the next section first fails: that image does not exist yet**.
 
 ### Dependency drift (read this)
 
@@ -148,6 +193,21 @@ kubectl logs $POD | grep 'completed step'
 kubectl logs $POD | grep 'Slow PjRt'      # any output means it is stuck
 ```
 
+`items[0]` picks an arbitrary pod, which is fine here: MaxText prints
+`completed step` on **every** host, not just process 0. (What only happens on
+process 0 is the TensorBoard write — a separate matter, see
+[an unwritable output directory masquerades as a TPU hang](#an-unwritable-output-directory-masquerades-as-a-tpu-hang).)
+
+### How long until the first step
+
+**Expect roughly 6–7 minutes between `kubectl apply` and the first
+`completed step: 0`.** The log floods with HLO dumps during that window — that
+is normal XLA compilation, not a hang.
+
+Do not read the step 0 time in the results table (~100 s) as the wait time: it
+is MaxText's own timer and excludes image pull, JAX distributed init, and
+compilation. Judge a real hang by `Slow PjRt`, not by elapsed time.
+
 ## Measured results
 
 Environment: `cloud-tpu-multipod-dev`, us-central1-a, spot, 2026-07-27
@@ -172,14 +232,57 @@ This recipe keeps **every tuning param and all 33 XLA flags from the upstream
 | Tokens/s/device | 477.1 |
 | loss (step 0 → 15) | 12.27 → 9.9, monotonically decreasing |
 
-Steady state begins at step 3, with ±0.05 s jitter. Steps 5–12 carry extra
-overhead from the xplane profiler and should be excluded when reading numbers
-(the upstream config also enables the profiler, so the comparison is fair).
+Steady state begins at step 3, with ±0.06 s jitter.
+
+**Only steps 5, 10 and 12 carry profiler overhead — not the whole 5–12 range.**
+In the same run, steps 7/8/9 measured 68.82 / 68.71 / 68.71 s, indistinguishable
+from steps 3/4/13 (68.71 / 68.73 / 68.73 s). They are clean steady-state points.
+
+Use this table when reading the log:
+
+| step | State | Use it? |
+| --- | --- | --- |
+| 0 | includes the first compile | ✗ |
+| 1, 6, 11 | JAX async-dispatch artifact (0.005–0.3 s, inflated TFLOP) | ✗ |
+| 2 | not yet converged (91.8 s) | ✗ |
+| **3, 4, 7, 8, 9, 13+** | **steady state** | **✓** |
+| 5, 10, 12 | xplane profiler write overhead (104–137 s) | ✗ |
+
+The upstream config also enables the profiler, so the comparison stays fair.
 
 The `step 1` line reports something like 29492 TFLOP/s/device. That is an
 artifact of **JAX async dispatch** — the log prints before the computation
 actually completes. The 0.006 s readings at steps 6 and 11 are the same
 artifact; each pairs with the step before it.
+
+### Independent reproduction (2026-07-27, different operator, same node pool)
+
+A second person re-ran this document end to end with the same image under a
+different workload name:
+
+| Metric | Original record | Reproduction | Delta |
+| --- | --- | --- | --- |
+| Steady-state step time | 68.70 s | 68.71 s (step 9) / 68.82 s (step 7) | +0.02% |
+| TFLOP/s/device | 134.1 | 134.08 | −0.01% |
+| Tokens/s/device | 477.1 | 476.9 | −0.04% |
+| loss at step 0 | 12.27 | 12.270 | identical |
+| final loss | 9.9 (step 15) | 9.890 (step 12) | identical |
+| step 0 | 93.0 s | 104.1 s | **+11.9%** |
+
+**The steady-state numbers reproduce to one decimal place**, so the recipe
+itself is deterministic.
+
+The only divergence is **step 0 (93.0 → 104.1 s)**. That step includes the
+first XLA compile and varies with compile cache and node state — **do not read
+it as a performance metric**.
+
+The reproduction also confirmed each of the "looks wrong but is normal"
+behaviours documented here:
+
+- step 1 reported **30767 TFLOP/s/device** (original: 29492) — async-dispatch artifact
+- steps 6 and 11 at **0.005 s** — same artifact, paired with the preceding step
+- steps 10 and 12 at **137.5 s / 104.3 s** — xplane profiler overhead,
+  consistent with "exclude 5–12"
 
 ### `per_device_batch_size` tops out at 4
 
@@ -337,9 +440,13 @@ kubectl delete jobset $WORKLOAD_NAME
 ```
 
 Deletion is asynchronous. Before submitting the next job you **must wait for
-all pods to disappear**, otherwise the new pods contend for nodes whose TPUs
-are still held by the old ones:
+this job's pods to disappear**, otherwise the new pods contend for nodes whose
+TPUs are still held by the old ones:
 
 ```bash
-while [ "$(kubectl get pods --no-headers | wc -l)" -ne 0 ]; do sleep 10; done
+while [ "$(kubectl get pods -l jobset.sigs.k8s.io/jobset-name=$WORKLOAD_NAME --no-headers 2>/dev/null | wc -l)" -ne 0 ]; do sleep 10; done
 ```
+
+**Do not drop the `-l jobset.sigs.k8s.io/jobset-name=...` selector.** Counting
+the raw `kubectl get pods` output instead includes every unrelated pod in the
+namespace — near certain on a shared cluster — and the loop never exits.

@@ -59,10 +59,10 @@ v7 does not use this naming in GKE; it uses machine types like
 
 ```
 v5p:  MFU = TFLOP/s/device        / 459     # 1 device = 1 chip
-v7x:  MFU = TFLOP/s/device × 2    / 2307    # 1 chip = 2 devices
+v7x:  MFU = TFLOP/s/device × 2    / 2306    # 1 chip = 2 devices
 ```
 
-459 and 2307 are the **per-chip** BF16 peaks in TFLOPS for v5p and v7.
+459 and 2306 are the **per-chip** BF16 peaks in TFLOPS for v5p and v7.
 
 **The `× 2` that applies on v7 must not be carried over to v5p** — this is the
 easiest step to copy incorrectly.

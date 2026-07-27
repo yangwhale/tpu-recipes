@@ -33,7 +33,7 @@ MFU 的算法因此也不同：
 
 ```
 v5p:  MFU = TFLOP/s/device        / 459
-v7x:  MFU = TFLOP/s/device × 2    / 2307
+v7x:  MFU = TFLOP/s/device × 2    / 2306
 ```
 
 **v7x 上那个 `× 2` 搬到 v5p 就会把 MFU 算成两倍。**
@@ -96,9 +96,27 @@ v5p 配方用的是另一组：
 
 ### 5. 并行参数的组合不一样
 
-v7x DeepSeek 配方用 `ici_fsdp_transpose_parallelism` 和
-`ici_pipeline_parallelism`；v5p 配方用 `ici_tensor_parallelism`。
+两代唯一共用的是 `ici_fsdp_parallelism=-1`，其余各走各的：
+
+| 参数 | v7x DeepSeek | v5p DeepSeek 256chips |
+| --- | --- | --- |
+| `ici_fsdp_parallelism` | `-1` | `-1` |
+| `ici_fsdp_transpose_parallelism` | `1`（4x4x8）/ `2`（4x8x8） | 不用 |
+| `ici_pipeline_parallelism` | `1` | 不用 |
+| `ici_tensor_parallelism` | 不用 | `1` |
+| `dcn_data_parallelism` | `-1` | 不用 |
+| `dcn_pipeline_parallelism` | `1` | 不用 |
+
+两点容易被忽略：
+
+- `ici_fsdp_transpose_parallelism` 的值**随拓扑变**（4x4x8 是 1，4x8x8 是 2），
+  不是固定常数，换拓扑时不能照抄
+- `dcn_*` 是跨 slice 维度，v7x 配方带着是因为它按多 slice 组织；
+  本 v5p 配方是单 slice，没有这一层
+
 不要跨代际照抄并行配置。
+（来源：`ironwood/deepseek3-671b/*/k8s/k8s_manifest.yaml` 与
+[256chips 配方 manifest](DeepSeek3-671B-MaxText-256chips/k8s/k8s_manifest.yaml)）
 
 ### 6. placement policy 由 GKE 自动生成
 
@@ -110,6 +128,21 @@ Required field 'resource.requestedRunDuration' not specified
 ```
 
 v5p 节点池创建时不要带 `--placement-policy`，GKE 会自动生成 `COMPACT`。
+
+已在两种规模上验证过「自动生成」这半句（创建时只传 `--tpu-topology`，
+不带 placement 相关参数，建完 describe 出来都带 `type: COMPACT`）：
+
+| 节点池 | 传入的 topology | GKE 自动生成 |
+| --- | --- | --- |
+| 64 台（multi-host） | `4x8x8` | `tpuTopology: 4x8x8, type: COMPACT` |
+| 1 台（single-host） | `2x2x1` | `tpuTopology: 2x2x1, type: COMPACT` |
+
+验证命令：
+
+```bash
+gcloud container node-pools describe <NODEPOOL> --cluster <CLUSTER> \
+  --region <REGION> --format='yaml(placementPolicy)'
+```
 
 ## 配方列表
 
