@@ -140,52 +140,87 @@ kubectl logs $POD | grep 'Slow PjRt'      # 出现即表示卡住了
 
 环境：`cloud-tpu-multipod-dev`，us-central1-a，spot，2026-07-27
 
+本配方**完整沿用官方 `deepseek3_671b_v5p_1024` 的全部 tuning params 与 33 个
+XLA flag**，只把 `per_device_batch_size` 从 6 降到 4——这是 256 chips 上唯一
+必须改的参数。
+
 | 项目 | 值 |
 | --- | --- |
 | chips | 256（64 VM × 4） |
 | JAX devices | 256 |
 | 拓扑 | `4x8x8` COMPACT |
 | 序列长度 | 8192 |
-| `per_device_batch_size` | 3 |
-| global batch size | 768 |
+| `per_device_batch_size` | 4 |
+| global batch size | 1024 |
 | 精度 | bf16（权重 fp32） |
-| step 0（含编译） | 81.8 s |
-| **稳态 step 时间** | **60.18 s** |
-| **TFLOP/s/device** | **114.82** |
-| **MFU** | **25.0%** |
-| Tokens/s/device | 408.5 |
-| loss（step 0 → 18） | 12.27 → 9.79 单调下降 |
+| step 0（含编译） | 93.0 s |
+| **稳态 step 时间** | **68.70 s** |
+| **TFLOP/s/device** | **134.1** |
+| **MFU** | **29.2%** |
+| Tokens/s/device | 477.1 |
+| loss（step 0 → 15） | 12.27 → 9.9 单调下降 |
 
-稳态从 step 3 开始，抖动 ±0.03 s。
+稳态从 step 3 开始，抖动 ±0.05 s。step 5–12 因 xplane profiler 开启而有额外开销，
+读数时应排除（官方配方同样带 profiler，横向对比时是公平的）。
 
-`step 1` 那行会显示 21671 TFLOP/s/device 之类的离谱数字，
+`step 1` 那行会显示 29492 TFLOP/s/device 之类的离谱数字，
 这是 **JAX 异步派发**造成的假象——日志在计算真正完成前就打印了，不是真实性能。
+step 6、11 出现 0.006 s 也是同一原因，它与前一步是配对的。
+
+### `per_device_batch_size` 的上限是 4
+
+官方在 512 chips 上用 6。256 chips 的权重分片翻倍（10.5 GB → 21 GB/device），
+腾不出那么多激活空间。实测阶梯：
+
+| pdb | 结果 |
+| --- | --- |
+| 6 | 编译期 OOM：`Used 112.37G of 95.74G hbm`，超 16.62 GB |
+| 5 | 运行期失败：`Attempting to reserve 68.03G at the bottom of memory... 66.40G reservable` |
+| **4** | **通过** |
+
+注意 pdb=5 的失败方式与 pdb=6 不同：它通过了编译期的 95.74 GB 检查，
+却卡在运行期 **bottom-of-memory 区域只有 66.40 GB 可预留**这个更紧的约束上。
+两个限制不是一回事，调 batch size 时两个都要留意。
 
 ### 与官方 512 chips 的对照
 
-官方配方在 512 chips 上报 152.4 TFLOP/s/device。本配方 256 chips 得到 114.8，
-下降约 25%。
+| | 官方 512 chips | 本配方 256 chips |
+| --- | --- | --- |
+| `per_device_batch_size` | 6 | 4 |
+| global batch size | 3072 | 1024 |
+| TFLOP/s/device | 152.4 | 134.1 |
+| MFU | 33.2% | 29.2% |
 
-但**这不是纯粹的规模效应**。本次运行相对官方配置有以下删减，
-每一项都可能压低 MFU：
+规模减半、batch 减三分之一的情况下，单卡吞吐保住了 88%。
 
-| 参数 | 官方 | 本次 | 影响 |
-| --- | --- | --- | --- |
-| `per_device_batch_size` | 6 | 3 | 每步计算量减半，overlap 变差 |
-| `tile_batch_seq` | 512 | 未设置 | megablox MoE tiling |
-| `tile_embed_dim` | 1024 | 未设置 | 同上 |
-| `tile_mlp_dim` | 1024 | 未设置 | 同上 |
-| `--2a886c8_chip_config_name` | `megachip_tccontrol` | 未设置 | SparseCore 运行模式 |
-| `--xla_tpu_use_tc_device_shape_on_sc` | true | 未设置 | 同上 |
-| `--xla_sc_enable_instruction_fusion` | false | 未设置 | 同上 |
-| `--xla_sc_disjoint_spmem` | false | 未设置 | 同上 |
-| `--xla_sc_disable_megacore_partitioning` | true | 未设置 | 同上 |
+差距主要来自 batch size：pdb 从 6 降到 4 让每步计算量减少，
+collective 与计算的 overlap 变差。这是 256 chips 上权重分片翻倍带来的硬约束，
+不是配置没调好。
 
-即：只开了 SparseCore 的三个 offload 开关，却没配它的运行模式，属于半吊子配置。
+### 参数不全会显著压低 MFU
+
+早期一版运行漏掉了官方的若干设置，只拿到 **114.82 TFLOP/s/device（MFU 25.0%）**。
+补齐后提升 **16.8%**。漏掉的是：
+
+| 参数 | 官方 | 漏掉的那版 |
+| --- | --- | --- |
+| `tile_batch_seq` | 512 | 未设置 |
+| `tile_embed_dim` | 1024 | 未设置 |
+| `tile_mlp_dim` | 1024 | 未设置 |
+| `--2a886c8_chip_config_name` | `megachip_tccontrol` | 未设置 |
+| `--xla_tpu_use_tc_device_shape_on_sc` | true | 未设置 |
+| `--xla_sc_enable_instruction_fusion` | false | 未设置 |
+| `--xla_sc_disjoint_spmem` | false | 未设置 |
+| `--xla_sc_disable_megacore_partitioning` | true | 未设置 |
+
+后五个是 SparseCore 的**运行模式**配置。只开
+`xla_tpu_enable_sparse_core_collective_offload_*` 三个 offload 开关而不配运行模式，
+属于半吊子状态——这也让「关掉 SparseCore 看看」这类对照实验失去意义。
+
 `tile_*` 三个参数在新版 MaxText 里已改名为 `wi_tile_*` / `wo_tile_*`，
-但在本 commit（`3eb77db3`）上是有效的，不该删。
+在本 commit（`3eb77db3`）上是有效的，不要因为在新版报错就删掉。
 
-**114.8 应视为下限而非该规模的真实上限。**
+**教训：从官方配方出发，只改被规模逼着改的那一个参数，不要顺手删减。**
 
 ## 踩坑速查表
 
@@ -282,6 +317,3 @@ kubectl delete jobset $WORKLOAD_NAME
 ```bash
 while [ "$(kubectl get pods --no-headers | wc -l)" -ne 0 ]; do sleep 10; done
 ```
-
-没等干净的表现是 HBM 莫名少一截（例如 v5p 只剩 66.40 GB 可用，
-而单 chip 应有 95.74 GB）。

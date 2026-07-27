@@ -150,54 +150,94 @@ kubectl logs $POD | grep 'Slow PjRt'      # any output means it is stuck
 
 Environment: `cloud-tpu-multipod-dev`, us-central1-a, spot, 2026-07-27
 
+This recipe keeps **every tuning param and all 33 XLA flags from the upstream
+`deepseek3_671b_v5p_1024` config**, changing only `per_device_batch_size` from
+6 to 4 — the one parameter that 256 chips forces you to change.
+
 | Item | Value |
 | --- | --- |
 | chips | 256 (64 VMs × 4) |
 | JAX devices | 256 |
 | Topology | `4x8x8` COMPACT |
 | Sequence length | 8192 |
-| `per_device_batch_size` | 3 |
-| Global batch size | 768 |
+| `per_device_batch_size` | 4 |
+| Global batch size | 1024 |
 | Precision | bf16 (fp32 weights) |
-| step 0 (incl. compile) | 81.8 s |
-| **Steady-state step time** | **60.18 s** |
-| **TFLOP/s/device** | **114.82** |
-| **MFU** | **25.0%** |
-| Tokens/s/device | 408.5 |
-| loss (step 0 → 18) | 12.27 → 9.79, monotonically decreasing |
+| step 0 (incl. compile) | 93.0 s |
+| **Steady-state step time** | **68.70 s** |
+| **TFLOP/s/device** | **134.1** |
+| **MFU** | **29.2%** |
+| Tokens/s/device | 477.1 |
+| loss (step 0 → 15) | 12.27 → 9.9, monotonically decreasing |
 
-Steady state begins at step 3, with ±0.03 s jitter.
+Steady state begins at step 3, with ±0.05 s jitter. Steps 5–12 carry extra
+overhead from the xplane profiler and should be excluded when reading numbers
+(the upstream config also enables the profiler, so the comparison is fair).
 
-The `step 1` line reports something like 21671 TFLOP/s/device. That is an
+The `step 1` line reports something like 29492 TFLOP/s/device. That is an
 artifact of **JAX async dispatch** — the log prints before the computation
-actually completes. It is not real throughput.
+actually completes. The 0.006 s readings at steps 6 and 11 are the same
+artifact; each pairs with the step before it.
+
+### `per_device_batch_size` tops out at 4
+
+Upstream uses 6 on 512 chips. At 256 chips the weight shard doubles
+(10.5 GB → 21 GB per device), leaving less room for activations. Measured ladder:
+
+| pdb | Result |
+| --- | --- |
+| 6 | Compile-time OOM: `Used 112.37G of 95.74G hbm`, over by 16.62 GB |
+| 5 | Runtime failure: `Attempting to reserve 68.03G at the bottom of memory... 66.40G reservable` |
+| **4** | **Works** |
+
+Note that pdb=5 fails differently from pdb=6: it passes the compile-time
+95.74 GB check but hits a tighter runtime constraint — only **66.40 GB is
+reservable at the bottom of memory**. These are two distinct limits; watch both
+when tuning batch size.
 
 ### Comparison against upstream at 512 chips
 
-The upstream recipe reports 152.4 TFLOP/s/device on 512 chips. This recipe
-gets 114.8 on 256 chips, about 25% lower.
+| | Upstream, 512 chips | This recipe, 256 chips |
+| --- | --- | --- |
+| `per_device_batch_size` | 6 | 4 |
+| Global batch size | 3072 | 1024 |
+| TFLOP/s/device | 152.4 | 134.1 |
+| MFU | 33.2% | 29.2% |
 
-**This is not purely a scaling effect.** This run dropped several settings
-relative to the upstream config, each of which can depress MFU:
+At half the scale and a third less batch, per-device throughput holds at 88%.
 
-| Parameter | Upstream | This run | Effect |
-| --- | --- | --- | --- |
-| `per_device_batch_size` | 6 | 3 | Half the work per step, worse overlap |
-| `tile_batch_seq` | 512 | unset | megablox MoE tiling |
-| `tile_embed_dim` | 1024 | unset | same |
-| `tile_mlp_dim` | 1024 | unset | same |
-| `--2a886c8_chip_config_name` | `megachip_tccontrol` | unset | SparseCore operating mode |
-| `--xla_tpu_use_tc_device_shape_on_sc` | true | unset | same |
-| `--xla_sc_enable_instruction_fusion` | false | unset | same |
-| `--xla_sc_disjoint_spmem` | false | unset | same |
-| `--xla_sc_disable_megacore_partitioning` | true | unset | same |
+The gap comes mostly from batch size: dropping pdb from 6 to 4 reduces work per
+step and degrades overlap between collectives and compute. That is a hard
+constraint imposed by the doubled weight shard at 256 chips, not a tuning miss.
 
-In other words: the three SparseCore *offload* switches were on, but its
-operating mode was never configured — a half-applied configuration. The three
-`tile_*` parameters were renamed to `wi_tile_*` / `wo_tile_*` in newer MaxText,
-but on this commit (`3eb77db3`) they are valid and should not have been removed.
+### An incomplete parameter set costs real MFU
 
-**Treat 114.8 as a floor, not as the ceiling for this scale.**
+An earlier run omitted several upstream settings and reached only
+**114.82 TFLOP/s/device (MFU 25.0%)**. Restoring them gained **16.8%**. What
+was missing:
+
+| Parameter | Upstream | The incomplete run |
+| --- | --- | --- |
+| `tile_batch_seq` | 512 | unset |
+| `tile_embed_dim` | 1024 | unset |
+| `tile_mlp_dim` | 1024 | unset |
+| `--2a886c8_chip_config_name` | `megachip_tccontrol` | unset |
+| `--xla_tpu_use_tc_device_shape_on_sc` | true | unset |
+| `--xla_sc_enable_instruction_fusion` | false | unset |
+| `--xla_sc_disjoint_spmem` | false | unset |
+| `--xla_sc_disable_megacore_partitioning` | true | unset |
+
+The last five configure SparseCore's **operating mode**. Enabling the three
+`xla_tpu_enable_sparse_core_collective_offload_*` switches without configuring
+the operating mode leaves it half-applied — which also invalidates any
+"disable SparseCore and compare" experiment.
+
+The three `tile_*` parameters were renamed to `wi_tile_*` / `wo_tile_*` in newer
+MaxText. On this commit (`3eb77db3`) they are valid — do not drop them just
+because a newer version rejects the name.
+
+**Lesson: start from the upstream config and change only the one parameter that
+scale forces you to change. Do not trim anything else along the way.**
 
 ## Troubleshooting quick reference
 
@@ -301,6 +341,3 @@ are still held by the old ones:
 ```bash
 while [ "$(kubectl get pods --no-headers | wc -l)" -ne 0 ]; do sleep 10; done
 ```
-
-The symptom of not waiting is mysteriously reduced HBM — for example only
-66.40 GB available on v5p, where a single chip should have 95.74 GB.
