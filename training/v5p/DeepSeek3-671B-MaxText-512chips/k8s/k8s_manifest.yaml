@@ -1,0 +1,75 @@
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: ${WORKLOAD_NAME}
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool # 1:1 job replica to node pool assignment
+spec:
+  ttlSecondsAfterFinished: 43200
+  failurePolicy:
+    rules:
+      - action: FailJobSet
+        onJobFailureReasons:
+        - PodFailurePolicy
+    maxRestarts: 0
+  replicatedJobs:
+    - name: slice-job
+      replicas: 1
+      template:
+        spec:
+          parallelism: 128    # Equal to the number of VMs per slice (or sub-slice).
+          completions: 128    # Same as the above.
+          backoffLimit: 0   # When any pod fails, the job is failed
+          podFailurePolicy:
+            rules:
+            - action: FailJob
+              onPodConditions: []
+              onExitCodes:
+                containerName: jax-tpu
+                operator: NotIn
+                values: [42,127,128,129,130,131,132,133,134,135,136,137,138,139,140,141,142,143,144,145,146,147,148,149,150,151,152,153,154,155,156,157,158,159,160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175,176,177,178,179,180,181,182,183,184,185,186,187,188,189,190,191,192,193,194,195,196,197,198,199,200,201,202,203,204,205,206,207,208,209,210,211,212,213,214,215,216,217,218,219,220,221,222,223,224,225,226,227,228,229,230,231,232,233,234,235,236,237,238,239,240,241,242,243,244,245,246,247,248,249,250,251,252,253,254,255]
+          template:
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu-v5p-slice
+                cloud.google.com/gke-tpu-topology: 8x8x8
+              hostNetwork: true
+              dnsPolicy: ClusterFirstWithHostNet
+              containers:
+              - name: jax-tpu
+                image: ${WORKLOAD_IMAGE}
+                ports:
+                - containerPort: 8471
+                - containerPort: 8080
+                securityContext:
+                  privileged: true
+                command:
+                - bash
+                - -c
+                - |
+                  echo XPK Start: $(date);
+                  _sigterm() (kill -SIGTERM $! 2>/dev/null;);
+                  trap _sigterm SIGTERM;
+                  (export TPU_STDERR_LOG_LEVEL=0 && export TPU_MIN_LOG_LEVEL=0 && export TF_CPP_MIN_LOG_LEVEL=0 && export TPU_VMODULE=real_program_continuator=1 && set -e && export ENABLE_PATHWAYS_PERSISTENCE='1' && export LIBTPU_INIT_ARGS='--xla_tpu_enable_async_collective_fusion_fuse_all_gather=false --xla_tpu_enable_async_collective_fusion_fuse_all_reduce=false --xla_tpu_enable_async_collective_fusion_fuse_reduce_scatter=false --xla_tpu_enable_sparse_core_collective_offload_all_gather=true --xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=true --xla_tpu_enable_sparse_core_collective_offload_all_reduce=true --xla_tpu_enable_all_gather_offload_tracing=true --xla_tpu_enable_reduce_scatter_offload_tracing=true --xla_tpu_enable_all_reduce_offload_tracing=true --xla_tpu_use_tc_device_shape_on_sc=true --xla_sc_enable_instruction_fusion=false --xla_sc_disjoint_spmem=false --xla_sc_disable_megacore_partitioning=true --2a886c8_chip_config_name=megachip_tccontrol --xla_tpu_enable_all_experimental_scheduler_features=true --xla_tpu_enable_scheduler_memory_pressure_tracking=true --xla_tpu_host_transfer_overlap_limit=24 --xla_tpu_aggressive_opt_barrier_removal=ENABLED --xla_lhs_prioritize_async_depth_over_stall=ENABLED --xla_tpu_enable_ag_backward_pipelining=true --xla_should_allow_loop_variant_parameter_in_chain=ENABLED --xla_should_add_loop_invariant_op_in_chain=ENABLED --xla_max_concurrent_host_send_recv=100 --xla_tpu_scheduler_percent_shared_memory_limit=100 --xla_latency_hiding_scheduler_rerun=2 --xla_tpu_use_minor_sharding_for_major_trivial_input=true --xla_tpu_relayout_group_size_threshold_for_reduce_scatter=1 --xla_tpu_assign_all_reduce_scatter_layout=true --xla_tpu_enable_data_parallel_all_reduce_opt=true --xla_tpu_data_parallel_opt_different_sized_ops=true --xla_tpu_scoped_vmem_limit_kib=81920 --xla_tpu_megacore_fusion_allow_ags=false --xla_enable_async_collective_permute=true ' && export JAX_PLATFORMS='tpu,cpu' && export ENABLE_PJRT_COMPATIBILITY='true' && cd /deps && python3 -m src.MaxText.train src/MaxText/configs/base.yml model_name=deepseek3-671b ici_fsdp_parallelism=-1 ici_tensor_parallelism=1 per_device_batch_size=6 max_target_length=8192 dtype=bfloat16 weight_dtype=float32 megablox=True sparse_matmul=True scan_layers=True use_custom_sort_vjp=True sa_block_q=2048 sa_block_kv=2048 sa_block_kv_compute=2048 sa_block_q_dkv=2048 sa_block_kv_dkv=2048 sa_block_kv_dkv_compute=2048 sa_block_q_dq=2048 sa_block_kv_dq=2048 remat_policy=custom decoder_layer_input=offload out_proj=offload tile_batch_seq=512 tile_embed_dim=1024 tile_mlp_dim=1024 sa_use_fused_bwd_kernel=False dataset_type=synthetic enable_checkpointing=False profiler=xplane skip_first_n_steps_for_profiler=5 profiler_steps=5 steps=30 base_output_directory=${BASE_OUTPUT_DIR} run_name=${WORKLOAD_NAME}) & PID=$!;
+                  while kill -0 $PID 2>/dev/null;
+                      do sleep 5;
+                  done;
+                  wait $PID;
+                  EXIT_CODE=$?;
+                  echo XPK End: $(date);
+                  echo EXIT_CODE=$EXIT_CODE;
+                  exit $EXIT_CODE
+                resources:
+                  limits:
+                    google.com/tpu: 4
+                volumeMounts:
+                - mountPath: /dev/shm
+                  name: dshm-2
+              tolerations:
+              - operator: "Exists"
+                key: google.com/tpu
+              volumes:
+              - emptyDir:
+                  medium: Memory
+                name: dshm-2

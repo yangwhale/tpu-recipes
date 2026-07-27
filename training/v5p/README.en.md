@@ -160,6 +160,7 @@ gcloud container node-pools describe <NODEPOOL> --cluster <CLUSTER> \
 | Recipe | Scale | Notes |
 | --- | --- | --- |
 | [DeepSeek3-671B-MaxText](DeepSeek3-671B-MaxText/README.md) | v5p-1024 (512 chips) | Upstream recipe, submitted via XPK |
+| [DeepSeek3-671B-MaxText-512chips](DeepSeek3-671B-MaxText-512chips/README.en.md) | 512 chips | Plain K8s manifest, **matches the upstream numbers to 0.3%** |
 | [DeepSeek3-671B-MaxText-256chips](DeepSeek3-671B-MaxText-256chips/README.en.md) | 256 chips | Plain K8s manifest, with a full troubleshooting record |
 | [Llama3.1-405B-MaxText](Llama3.1-405B-MaxText/README.md) | v5p-1024 | |
 | [Llama4-Scout-17B-16E-Maxtext](Llama4-Scout-17B-16E-Maxtext/README.md) | v5p-256 / 512 / 1024 | |
@@ -182,7 +183,13 @@ Numbers actually produced in this repository, not copied from upstream docs.
 
 | Model | chips | Topology | Seq len | GBS | Precision | Step time | TFLOP/s/device | MFU |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| DeepSeek V3 671B | 512 | 8x8x8 | 8192 | 3072 | bf16 | 90.41 s | 152.85 | 33.3% |
 | DeepSeek V3 671B | 256 | 4x8x8 | 8192 | 1024 | bf16 | 68.70 s | 134.1 | 29.2% |
+
+The 512-chip row is a verbatim reproduction of the upstream
+`deepseek3_671b_v5p_1024` recipe: 152.85 measured against the 152.415 upstream
+reports (**+0.29%**), with an exact `total_weights` match.
+**The upstream numbers reproduce.**
 
 Environment: `cloud-tpu-multipod-dev`, us-central1-a, spot, 2026-07-27. Full
 method and troubleshooting in
@@ -206,6 +213,17 @@ These apply to every v5p recipe here and were hit repeatedly in practice:
   `uv pip install --exclude-newer <date>`.
 - **XPK's wrapper swallows the exit code.** Pods still show `Completed` on a
   failed run. Judge success by `completed step` in the logs, not by JobSet status.
+- **A large node pool hits IP limits before TPU capacity.** GKE carves a pod CIDR
+  per node from `maxPodsPerNode`; the default of 110 maps to a `/24`, so a `/17`
+  pod range covers only 128 nodes for the entire cluster. Pass
+  `--max-pods-per-node=16` when creating large pools to cut the requirement to
+  one eighth. Details in
+  [the 512chips recipe](DeepSeek3-671B-MaxText-512chips/README.en.md#--max-pods-per-node16-is-not-optional).
+- **The JobSet controller's staging image tag gets reclaimed.** Existing nodes
+  keep running from their digest cache, but the moment the controller is
+  rescheduled it hits `ErrImagePull` and job submission fails with a missing
+  webhook endpoint. Switch to `registry.k8s.io/jobset/jobset:<version>` — see
+  [the 512chips recipe](DeepSeek3-671B-MaxText-512chips/README.en.md#the-jobset-controller-image-expires).
 
 Expanded in
 [the 256-chip recipe's troubleshooting table](DeepSeek3-671B-MaxText-256chips/README.en.md#troubleshooting-quick-reference).

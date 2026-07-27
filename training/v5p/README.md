@@ -151,6 +151,7 @@ gcloud container node-pools describe <NODEPOOL> --cluster <CLUSTER> \
 | 配方 | 规模 | 说明 |
 | --- | --- | --- |
 | [DeepSeek3-671B-MaxText](DeepSeek3-671B-MaxText/README.md) | v5p-1024（512 chips） | 官方配方，XPK 提交 |
+| [DeepSeek3-671B-MaxText-512chips](DeepSeek3-671B-MaxText-512chips/README.md) | 512 chips | 纯 K8s manifest，**对齐官方数字（偏差 0.3%）** |
 | [DeepSeek3-671B-MaxText-256chips](DeepSeek3-671B-MaxText-256chips/README.md) | 256 chips | 纯 K8s manifest，含完整踩坑记录 |
 | [Llama3.1-405B-MaxText](Llama3.1-405B-MaxText/README.md) | v5p-1024 | |
 | [Llama4-Scout-17B-16E-Maxtext](Llama4-Scout-17B-16E-Maxtext/README.md) | v5p-256 / 512 / 1024 | |
@@ -173,7 +174,12 @@ gcloud container node-pools describe <NODEPOOL> --cluster <CLUSTER> \
 
 | 模型 | chips | 拓扑 | 序列长度 | GBS | 精度 | step 时间 | TFLOP/s/device | MFU |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| DeepSeek V3 671B | 512 | 8x8x8 | 8192 | 3072 | bf16 | 90.41 s | 152.85 | 33.3% |
 | DeepSeek V3 671B | 256 | 4x8x8 | 8192 | 1024 | bf16 | 68.70 s | 134.1 | 29.2% |
+
+512 chips 那行是官方 `deepseek3_671b_v5p_1024` 配方的原样复现，
+实测 152.85 对官方报告的 152.415（**偏差 +0.29%**），`total_weights` 完全一致。
+**官方数字可复现。**
 
 环境：`cloud-tpu-multipod-dev`，us-central1-a，spot，2026-07-27。
 完整方法与踩坑见
@@ -195,6 +201,14 @@ v5p 的 `TFLOP/s/device` 就是 per-chip 值（1 chip = 1 device），
   `uv pip install --exclude-newer <日期>` 整套钉回去。
 - **XPK 的 wrapper 会吞掉退出码。** 训练失败时 pod 仍是 `Completed`。
   判断成败要看日志里的 `completed step`，不要看 JobSet 状态。
+- **大节点池会先撞上 IP 而不是 TPU 容量。** GKE 按 `maxPodsPerNode` 给每节点切
+  pod CIDR，默认 110 对应一个 `/24`，`/17` 的 pod 范围只够整个集群 128 个节点。
+  建大池时加 `--max-pods-per-node=16`，需求降到八分之一。
+  展开见 [512chips 配方](DeepSeek3-671B-MaxText-512chips/README.md#--max-pods-per-node16-不是可选项)。
+- **JobSet controller 用的 staging 镜像 tag 会被回收。** 老节点靠 digest 缓存能跑很久，
+  一旦 controller 被重调度到新节点就 `ErrImagePull`，提交作业报 webhook 无 endpoint。
+  换成 `registry.k8s.io/jobset/jobset:<版本>`，
+  见 [512chips 配方](DeepSeek3-671B-MaxText-512chips/README.md#jobset-controller-的镜像会失效)。
 
 展开说明见
 [DeepSeek3-671B-MaxText-256chips 的踩坑速查表](DeepSeek3-671B-MaxText-256chips/README.md#踩坑速查表)。

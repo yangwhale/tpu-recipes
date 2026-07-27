@@ -278,20 +278,28 @@ step 6、11 出现 0.006 s 也是同一原因，它与前一步是配对的。
 却卡在运行期 **bottom-of-memory 区域只有 66.40 GB 可预留**这个更紧的约束上。
 两个限制不是一回事，调 batch size 时两个都要留意。
 
-### 与官方 512 chips 的对照
+### 与 512 chips 的对照
 
-| | 官方 512 chips | 本配方 256 chips |
+512 chips 那一档我们也**实测过**（不是抄官方数字），见
+[DeepSeek3-671B-MaxText-512chips](../DeepSeek3-671B-MaxText-512chips/README.md)。
+
+| | 512 chips（实测） | 本配方 256 chips |
 | --- | --- | --- |
 | `per_device_batch_size` | 6 | 4 |
 | global batch size | 3072 | 1024 |
-| TFLOP/s/device | 152.4 | 134.1 |
-| MFU | 33.2% | 29.2% |
+| 稳态 step | 90.41 s | 68.70 s |
+| TFLOP/s/device | 152.85 | 134.1 |
+| MFU | 33.3% | 29.2% |
+| 每 device 权重分片 | 10.5 GB | 21 GB |
 
-规模减半、batch 减三分之一的情况下，单卡吞吐保住了 88%。
+**256 chips 拿到 512 chips 单卡吞吐的 87.7%。**
 
-差距主要来自 batch size：pdb 从 6 降到 4 让每步计算量减少，
-collective 与计算的 overlap 变差。这是 256 chips 上权重分片翻倍带来的硬约束，
-不是配置没调好。
+差距几乎全部来自 batch size：chips 减半后每 device 权重分片翻倍
+（10.5 → 21 GB），挤掉激活空间，pdb 只能从 6 降到 4。每步计算量变少，
+collective 与计算的 overlap 就变差。这是硬约束，不是配置没调好。
+
+作为参照，512 chips 那轮实测 152.85 对官方报告的 152.415，偏差 +0.29%，
+即**官方数字本身是可复现的**。
 
 ### 参数不全会显著压低 MFU
 

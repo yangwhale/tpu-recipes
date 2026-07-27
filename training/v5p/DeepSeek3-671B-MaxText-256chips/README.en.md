@@ -300,20 +300,30 @@ Note that pdb=5 fails differently from pdb=6: it passes the compile-time
 reservable at the bottom of memory**. These are two distinct limits; watch both
 when tuning batch size.
 
-### Comparison against upstream at 512 chips
+### Against 512 chips
 
-| | Upstream, 512 chips | This recipe, 256 chips |
+We measured the 512-chip configuration ourselves rather than quoting upstream —
+see [DeepSeek3-671B-MaxText-512chips](../DeepSeek3-671B-MaxText-512chips/README.en.md).
+
+| | 512 chips (measured) | This recipe, 256 chips |
 | --- | --- | --- |
 | `per_device_batch_size` | 6 | 4 |
 | Global batch size | 3072 | 1024 |
-| TFLOP/s/device | 152.4 | 134.1 |
-| MFU | 33.2% | 29.2% |
+| Steady-state step | 90.41 s | 68.70 s |
+| TFLOP/s/device | 152.85 | 134.1 |
+| MFU | 33.3% | 29.2% |
+| Weight shard per device | 10.5 GB | 21 GB |
 
-At half the scale and a third less batch, per-device throughput holds at 88%.
+**256 chips reaches 87.7% of the per-device throughput of 512 chips.**
 
-The gap comes mostly from batch size: dropping pdb from 6 to 4 reduces work per
-step and degrades overlap between collectives and compute. That is a hard
-constraint imposed by the doubled weight shard at 256 chips, not a tuning miss.
+Almost all of the gap comes from batch size: halving the chip count doubles the
+weight shard per device (10.5 → 21 GB), squeezing out activation space and
+forcing pdb from 6 down to 4. Less work per step means worse overlap between
+collectives and compute. That is a hard constraint, not a tuning miss.
+
+For reference, the 512-chip run measured 152.85 against the 152.415 upstream
+reports — +0.29%, meaning **the upstream numbers themselves reproduce**.
+
 
 ### An incomplete parameter set costs real MFU
 
